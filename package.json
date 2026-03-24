@@ -13,7 +13,6 @@
     "test": "npm run build && node --test --experimental-test-coverage build/__tests__/transforms.test.js"
   },
   "devDependencies": {
-    "@types/bun": "latest",
     "@types/dotenv": "^6.1.1",
     "@types/node": "^22",
     "typescript": "^5"

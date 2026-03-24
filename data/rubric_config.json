@@ -1,0 +1,40 @@
+{
+  "rubric_version": "1.0",
+  "created": "2026-03-25",
+  "description": "Phil Rebuild Rubric — 5-dimension scorecard for Slop Tier Players 2026-2027 rebuild",
+
+  "milestones": [
+    { "label": "2026 All-Star",        "date": "2026-07-10", "target_median": 28 },
+    { "label": "2026 End of Season",   "date": "2026-09-20", "target_median": 27 },
+    { "label": "2027 All-Star",        "date": "2027-07-10", "target_median": 26 },
+    { "label": "2027 End of Season",   "date": "2027-09-20", "target_median": 25 }
+  ],
+
+  "age_weights": {
+    "22_and_under": 5,
+    "23_to_24":     4,
+    "25_to_26":     3,
+    "27_to_28":     2,
+    "29":           1,
+    "30_plus":      0
+  },
+
+  "top_30_bonus_players": [
+    "Shohei Ohtani",
+    "Cal Raleigh"
+  ],
+
+  "competitive_targets": {
+    "rebuild_years_playoff_expected": false,
+    "win_rate_floor": 0.45,
+    "win_rate_target": 0.55
+  },
+
+  "regret_rate_thresholds": {
+    "sharp":      20,
+    "acceptable": 40,
+    "concerning": 60
+  },
+
+  "young_core_baseline": null
+}

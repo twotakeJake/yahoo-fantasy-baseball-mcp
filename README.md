@@ -39,7 +39,7 @@ Age data is pulled live from the **MLB Stats API** and cross-referenced by name 
 | `team_needs_analysis` | Positional thin spots and young assets for every team in the league |
 | `trade_partner_finder` | Given a player you want to move, finds which teams need that position and ranks by young talent they can offer back |
 | `get_trade_scenarios` | Reads `docs/trade_scenarios.md` — counter-offer reference for crown jewels (Ohtani, Raleigh) |
-| `auto_generate_trade_pitch` | Drafts a trade pitch for a player you want: finds their team's needs, scores your assets, builds a structured offer |
+| `auto_generate_trade_pitch` | Two modes: **buying** (acquire a player) or **selling** (move one). Scores all assets with live ADP, generates floor/target/ceiling offer tiers, and writes a structured pitch with rationale |
 
 ### League & Matchup
 

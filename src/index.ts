@@ -483,16 +483,22 @@ class FlatbottomPhil {
         {
           name: 'auto_generate_trade_pitch',
           description:
-            'Draft a trade pitch for a player you want. Analyzes the target team\'s positional needs and ' +
-            'your available assets, then writes a structured offer with rationale.',
+            'Draft a trade pitch with floor/target/ceiling offer tiers and live ADP scoring. ' +
+            'Two modes: buying (you want someone) or selling (you want to move someone). ' +
+            'Analyzes positional needs, scores assets with real ADP, and writes a structured pitch.',
           inputSchema: {
             type: 'object',
             properties: {
-              target_player: { type: 'string', description: 'Player you want to acquire' },
-              target_team: { type: 'string', description: 'Team that owns them (partial name match)' },
-              max_offer_age: { type: 'number', description: 'Max age of players you\'re willing to offer (default: 32)' },
+              mode: {
+                type: 'string',
+                enum: ['buying', 'selling'],
+                description: 'buying = you want to acquire a player; selling = you want to move one (default: buying)',
+              },
+              target_player: { type: 'string', description: 'Player you want to acquire (buying mode)' },
+              offer_player: { type: 'string', description: 'Player you want to move (selling mode)' },
+              target_team: { type: 'string', description: 'Team that owns the target (buying) or best landing spot (selling) — partial name match' },
+              max_offer_age: { type: 'number', description: 'Max age of players you\'re willing to offer in buying mode (default: 32)' },
             },
-            required: ['target_player'],
             additionalProperties: false,
           },
         },
@@ -2270,12 +2276,41 @@ class FlatbottomPhil {
     };
   }
 
+  // Fetch live ADP for a single player via Yahoo player search
+  private async fetchAdpForPlayer(name: string, leagueKey: string): Promise<number | null> {
+    try {
+      const res = await this.yahooApi.get(
+        `/league/${leagueKey}/players;search=${encodeURIComponent(name)};count=1;out=draft_analysis`,
+        { headers: this.authHeaders(), params: { format: 'json' } }
+      );
+      const players = res.data.fantasy_content.league[1].players;
+      const first = players?.['0'];
+      const adpRaw = first?.player[1]?.draft_analysis?.average_pick;
+      return adpRaw ? parseFloat(adpRaw) : null;
+    } catch { return null; }
+  }
+
+  // Build an offer package whose combined score reaches targetPct × targetValue.
+  // Pulls from a pre-sorted, ADP-enriched candidate list.
+  private buildOfferTier(candidates: any[], targetValue: number, targetPct: number): { players: any[]; total: number } {
+    const goal = targetValue * targetPct;
+    const offer: any[] = [];
+    let total = 0;
+    for (const c of candidates) {
+      if (total >= goal) break;
+      offer.push(c);
+      total += c.score;
+    }
+    return { players: offer, total: parseFloat(total.toFixed(2)) };
+  }
+
   private async autoGenerateTradePitch(args: any) {
-    const targetPlayer: string = args?.target_player ?? '';
+    const mode: string = args?.mode ?? 'buying';
     const targetTeamFilter: string | undefined = args?.target_team;
     const maxOfferAge: number = args?.max_offer_age ?? 32;
 
     const ageMap = await this.getAgeMap();
+    const leagueKey = await this.buildLeagueKey();
     const configPath = path.join(DATA_DIR, 'rubric_config.json');
     const cfg = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, 'utf8')) : {};
     const top30: string[] = cfg.top_30_bonus_players ?? [];
@@ -2284,7 +2319,105 @@ class FlatbottomPhil {
     const myTeam = allTeams.find((t) => t.isMe);
     if (!myTeam) return { content: [{ type: 'text', text: 'Could not find your team.' }] };
 
-    // Find the target player and their team
+    // ── SELLING MODE ──────────────────────────────────────────────────────────
+    if (mode === 'selling') {
+      const offerPlayerName: string = args?.offer_player ?? '';
+      if (!offerPlayerName) return { content: [{ type: 'text', text: 'selling mode requires offer_player.' }] };
+
+      const offerNorm = normalizeName(offerPlayerName);
+      const offerPlayerInfo = myTeam.roster.find((p: any) =>
+        normalizeName(p.name).includes(offerNorm) || offerNorm.includes(normalizeName(p.name))
+      );
+      if (!offerPlayerInfo) {
+        return { content: [{ type: 'text', text: `Could not find "${offerPlayerName}" on your roster.` }] };
+      }
+
+      // Enrich offer player with live ADP
+      const offerAdp = await this.fetchAdpForPlayer(offerPlayerInfo.name, leagueKey);
+      const offerScore = this.scorePlayer(offerPlayerInfo.name, offerPlayerInfo.position, offerPlayerInfo.age, offerAdp, top30);
+
+      // Find teams thin at offer player's position
+      const offerBuckets = this.positionBuckets(offerPlayerInfo.position);
+      const buyerTeams = allTeams
+        .filter((t) => !t.isMe)
+        .filter((t) => !targetTeamFilter || t.teamName.toLowerCase().includes(targetTeamFilter.toLowerCase()))
+        .map((t) => {
+          const posDepth: Record<string, number> = {};
+          for (const p of t.roster) {
+            for (const b of this.positionBuckets(p.position)) {
+              posDepth[b] = (posDepth[b] ?? 0) + 1;
+            }
+          }
+          const needsPosition = offerBuckets.some((b) => (posDepth[b] ?? 0) <= 2);
+          // Score their young return assets
+          const youngAssets = t.roster
+            .filter((p: any) => (p.age ?? 99) <= 27)
+            .map((p: any) => ({ ...p, score: this.scorePlayer(p.name, p.position, p.age, null, top30).total }))
+            .sort((a: any, b: any) => b.score - a.score);
+          const returnPool = youngAssets.reduce((s: number, p: any) => s + p.score, 0);
+          return { team: t, needsPosition, youngAssets, returnPool, posDepth };
+        })
+        .sort((a, b) => {
+          if (a.needsPosition !== b.needsPosition) return a.needsPosition ? -1 : 1;
+          return b.returnPool - a.returnPool;
+        });
+
+      if (buyerTeams.length === 0) {
+        return { content: [{ type: 'text', text: 'No suitable buyer teams found.' }] };
+      }
+
+      const bestBuyer = buyerTeams[0]!;
+
+      // Build ask tiers (what you want back from them)
+      const askCandidates = bestBuyer.youngAssets;
+      const floorAsk  = this.buildOfferTier(askCandidates, offerScore.total, 0.80);
+      const targetAsk = this.buildOfferTier(askCandidates, offerScore.total, 1.00);
+      const ceilingAsk = this.buildOfferTier(askCandidates, offerScore.total, 1.20);
+
+      const fmtPlayers = (players: any[]) =>
+        players.map((p: any) => `${p.name} (${p.position}, age ${p.age ?? '?'})`).join(', ') || '(none available)';
+
+      const pitch = [
+        `Selling: ${offerPlayerInfo.name} (${offerPlayerInfo.position}, age ${offerPlayerInfo.age ?? '?'}) — ADP tier: ${offerScore.adp_tier}`,
+        ``,
+        `Best landing spot: ${bestBuyer.team.teamName}${bestBuyer.needsPosition ? ` (thin at ${offerBuckets.join('/')})` : ''}`,
+        ``,
+        `Ask tiers (what to request in return):`,
+        `  Ceiling ask (open with): ${fmtPlayers(ceilingAsk.players)} — total score ${ceilingAsk.total.toFixed(1)}`,
+        `  Target ask (want):       ${fmtPlayers(targetAsk.players)} — total score ${targetAsk.total.toFixed(1)}`,
+        `  Floor ask (walk-away):   ${fmtPlayers(floorAsk.players)} — total score ${floorAsk.total.toFixed(1)}`,
+        ``,
+        `Your player's score: ${offerScore.total.toFixed(1)}`,
+        ``,
+        `Why they take it: ${bestBuyer.needsPosition ? `They're thin at ${offerBuckets.join('/')} — this fills a real hole.` : 'Lead with the upgrade angle over their current starter.'}`,
+      ].join('\n');
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            mode: 'selling',
+            pitch,
+            your_player: { name: offerPlayerInfo.name, position: offerPlayerInfo.position, age: offerPlayerInfo.age, adp: offerAdp, score: offerScore.total, adp_tier: offerScore.adp_tier },
+            best_buyer: bestBuyer.team.teamName,
+            buyer_needs_position: bestBuyer.needsPosition,
+            ask_tiers: {
+              ceiling: { players: ceilingAsk.players.map((p: any) => ({ name: p.name, position: p.position, age: p.age, score: p.score })), total: ceilingAsk.total },
+              target:  { players: targetAsk.players.map((p: any) => ({ name: p.name, position: p.position, age: p.age, score: p.score })), total: targetAsk.total },
+              floor:   { players: floorAsk.players.map((p: any) => ({ name: p.name, position: p.position, age: p.age, score: p.score })), total: floorAsk.total },
+            },
+            other_buyer_teams: buyerTeams.slice(1, 4).map((b) => ({
+              team: b.team.teamName, needs_position: b.needsPosition, young_return_pool: parseFloat(b.returnPool.toFixed(1)),
+            })),
+          }, null, 2),
+        }],
+      };
+    }
+
+    // ── BUYING MODE ───────────────────────────────────────────────────────────
+    const targetPlayer: string = args?.target_player ?? '';
+    if (!targetPlayer) return { content: [{ type: 'text', text: 'buying mode requires target_player.' }] };
+
     const targetNorm = normalizeName(targetPlayer);
     let ownerTeam: any = null;
     let targetPlayerInfo: any = null;
@@ -2292,12 +2425,10 @@ class FlatbottomPhil {
     for (const team of allTeams) {
       if (team.isMe) continue;
       if (targetTeamFilter && !team.teamName.toLowerCase().includes(targetTeamFilter.toLowerCase())) continue;
-      const found = team.roster.find((p: any) => normalizeName(p.name).includes(targetNorm) || targetNorm.includes(normalizeName(p.name)));
-      if (found) {
-        ownerTeam = team;
-        targetPlayerInfo = found;
-        break;
-      }
+      const found = team.roster.find((p: any) =>
+        normalizeName(p.name).includes(targetNorm) || targetNorm.includes(normalizeName(p.name))
+      );
+      if (found) { ownerTeam = team; targetPlayerInfo = found; break; }
     }
 
     if (!ownerTeam || !targetPlayerInfo) {
@@ -2309,91 +2440,86 @@ class FlatbottomPhil {
       };
     }
 
-    // Analyze the owner team's positional depth to find their thin spots
+    // Positional thin spots on the owner's team
     const posDepth: Record<string, number> = {};
     for (const p of ownerTeam.roster) {
       for (const b of this.positionBuckets(p.position)) {
         posDepth[b] = (posDepth[b] ?? 0) + 1;
       }
     }
-    const thinSpots = Object.entries(posDepth)
-      .filter(([, cnt]) => cnt <= 2)
-      .map(([pos]) => pos)
-      .sort();
+    const thinSpots = Object.entries(posDepth).filter(([, cnt]) => cnt <= 2).map(([pos]) => pos).sort();
 
-    // Score my roster players as potential offer pieces
-    const myOfferCandidates = myTeam.roster
-      .filter((p: any) => {
-        const age = p.age ?? 99;
-        return age <= maxOfferAge && normalizeName(p.name) !== normalizeName(targetPlayer);
-      })
+    // Initial sort of my offer candidates (no ADP yet — fast pass)
+    const rawCandidates = myTeam.roster
+      .filter((p: any) => (p.age ?? 99) <= maxOfferAge && !normalizeName(p.name).includes(targetNorm))
       .map((p: any) => {
-        const score = this.scorePlayer(p.name, p.position, p.age, null, top30);
         const fillsThinSpot = this.positionBuckets(p.position).some((b) => thinSpots.includes(b));
-        return { ...p, score: score.total, fills_need: fillsThinSpot };
+        return { ...p, fillsThinSpot };
       })
       .sort((a: any, b: any) => {
-        // Prioritize players that fill a thin spot, then by score descending
-        if (a.fills_need !== b.fills_need) return a.fills_need ? -1 : 1;
-        return b.score - a.score;
+        if (a.fillsThinSpot !== b.fillsThinSpot) return a.fillsThinSpot ? -1 : 1;
+        return (a.age ?? 99) - (b.age ?? 99); // younger first as tiebreak
       });
 
-    // Score the target player
-    const targetScore = this.scorePlayer(
-      targetPlayerInfo.name,
-      targetPlayerInfo.position,
-      targetPlayerInfo.age,
-      null,
-      top30
-    );
+    // Enrich top 10 candidates + target player with live ADP in parallel
+    const topCandidates = rawCandidates.slice(0, 10);
+    const [targetAdp, ...candidateAdps] = await Promise.all([
+      this.fetchAdpForPlayer(targetPlayerInfo.name, leagueKey),
+      ...topCandidates.map((p: any) => this.fetchAdpForPlayer(p.name, leagueKey)),
+    ]);
 
-    // Build the offer: pick top candidates whose combined score ≥ target score
-    const offer: any[] = [];
-    let offerTotal = 0;
-    for (const candidate of myOfferCandidates) {
-      if (offerTotal >= targetScore.total * 0.85) break; // don't over-offer
-      offer.push(candidate);
-      offerTotal += candidate.score;
-      if (offerTotal >= targetScore.total) break;
-    }
+    const targetScore = this.scorePlayer(targetPlayerInfo.name, targetPlayerInfo.position, targetPlayerInfo.age, targetAdp, top30);
 
-    // Build the pitch narrative
+    const scoredCandidates = topCandidates.map((p: any, i: number) => {
+      const adp = candidateAdps[i] ?? null;
+      const score = this.scorePlayer(p.name, p.position, p.age, adp, top30);
+      return { ...p, adp, score: score.total, adp_tier: score.adp_tier, fills_need: p.fillsThinSpot };
+    }).sort((a: any, b: any) => {
+      if (a.fills_need !== b.fills_need) return a.fills_need ? -1 : 1;
+      return b.score - a.score;
+    });
+
+    // Build three offer tiers
+    const floorOffer   = this.buildOfferTier(scoredCandidates, targetScore.total, 0.80);
+    const targetOffer  = this.buildOfferTier(scoredCandidates, targetScore.total, 1.00);
+    const ceilingOffer = this.buildOfferTier(scoredCandidates, targetScore.total, 1.20);
+
+    const fmtPlayers = (players: any[]) =>
+      players.map((p: any) => `${p.name} (${p.position}, age ${p.age ?? '?'})`).join(', ') || '(none available)';
+
     const needsPhrase = thinSpots.length > 0
       ? `Their roster is thin at ${thinSpots.join(', ')}.`
       : 'Their roster looks balanced — lead with the age/upside angle.';
 
-    const offerNames = offer.map((p: any) => `${p.name} (${p.position}, age ${p.age ?? '?'})`).join(', ');
     const pitch = [
-      `Target: ${targetPlayerInfo.name} (${targetPlayerInfo.position}, age ${targetPlayerInfo.age ?? '?'}) from ${ownerTeam.teamName}.`,
+      `Buying: ${targetPlayerInfo.name} (${targetPlayerInfo.position}, age ${targetPlayerInfo.age ?? '?'}) from ${ownerTeam.teamName} — ADP tier: ${targetScore.adp_tier}`,
       ``,
-      `Pitch: Offer ${offerNames}.`,
+      `Offer tiers:`,
+      `  Floor (open with):   ${fmtPlayers(floorOffer.players)} — total score ${floorOffer.total.toFixed(1)}`,
+      `  Target (want):       ${fmtPlayers(targetOffer.players)} — total score ${targetOffer.total.toFixed(1)}`,
+      `  Ceiling (max give):  ${fmtPlayers(ceilingOffer.players)} — total score ${ceilingOffer.total.toFixed(1)}`,
       ``,
-      `Why they take it:`,
-      `- ${needsPhrase}`,
-      `- Your offer fills a need${offer.some((p: any) => p.fills_need) ? ' directly (position match)' : ' with value they can use'}.`,
+      `Target score: ${targetScore.total.toFixed(1)}`,
       ``,
-      `Why you take it:`,
-      `- ${targetPlayerInfo.name} at age ${targetPlayerInfo.age ?? '?'} fits your rebuild timeline.`,
-      `- Reduces your median age while adding ${targetScore.adp_tier} talent.`,
-      ``,
-      `Value check: Target score ${targetScore.total.toFixed(1)} vs offer total ${offerTotal.toFixed(1)} — ${
-        offerTotal >= targetScore.total ? 'fair or slightly in their favor (they should take this)' :
-        offerTotal >= targetScore.total * 0.85 ? 'slightly under — mention upside angle' :
-        'under market — consider adding a piece'
-      }.`,
+      `Why they take it: ${needsPhrase}${thinSpots.length > 0 && scoredCandidates.some((p: any) => p.fills_need) ? ' Your offer fills that gap directly.' : ''}`,
+      `Why you take it: ${targetPlayerInfo.name} at age ${targetPlayerInfo.age ?? '?'} fits the rebuild. Adds ${targetScore.adp_tier} talent.`,
     ].join('\n');
 
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
+          mode: 'buying',
           pitch,
-          target: { name: targetPlayerInfo.name, position: targetPlayerInfo.position, age: targetPlayerInfo.age, score: targetScore.total, tier: targetScore.adp_tier },
+          target: { name: targetPlayerInfo.name, position: targetPlayerInfo.position, age: targetPlayerInfo.age, adp: targetAdp, score: targetScore.total, adp_tier: targetScore.adp_tier },
           owner_team: ownerTeam.teamName,
           their_thin_spots: thinSpots,
-          your_offer: offer.map((p: any) => ({ name: p.name, position: p.position, age: p.age, score: p.score, fills_need: p.fills_need })),
-          offer_total_score: parseFloat(offerTotal.toFixed(2)),
-          target_score: targetScore.total,
+          offer_tiers: {
+            floor:   { players: floorOffer.players.map((p: any) => ({ name: p.name, position: p.position, age: p.age, adp: p.adp, score: p.score })), total: floorOffer.total },
+            target:  { players: targetOffer.players.map((p: any) => ({ name: p.name, position: p.position, age: p.age, adp: p.adp, score: p.score })), total: targetOffer.total },
+            ceiling: { players: ceilingOffer.players.map((p: any) => ({ name: p.name, position: p.position, age: p.age, adp: p.adp, score: p.score })), total: ceilingOffer.total },
+          },
+          scoring_note: 'Scores use live ADP from Yahoo draft analysis. Higher = more valuable.',
         }, null, 2),
       }],
     };

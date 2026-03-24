@@ -433,6 +433,69 @@ class FlatbottomPhil {
             additionalProperties: false,
           },
         },
+        {
+          name: 'evaluate_advice',
+          description:
+            'Phil\'s accountability log. ' +
+            'Log advice Phil gave, record what actually happened, and score Phil\'s hit rate over time. ' +
+            'Actions: log (record a call), outcome (update with what happened), score (see Phil\'s batting average).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: ['log', 'outcome', 'score'],
+                description: 'log = record a call Phil made, outcome = update with result, score = see hit rate (default: score)',
+              },
+              call: { type: 'string', description: 'The advice or recommendation Phil made (for log)' },
+              category: {
+                type: 'string',
+                enum: ['drop', 'add', 'trade', 'hold', 'other'],
+                description: 'Type of advice (for log)',
+              },
+              players: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Players involved in the call (for log)',
+              },
+              advice_id: { type: 'number', description: 'ID of the advice entry to update (for outcome)' },
+              result: {
+                type: 'string',
+                enum: ['correct', 'incorrect', 'partial', 'tbd'],
+                description: 'How it turned out (for outcome)',
+              },
+              outcome_notes: { type: 'string', description: 'What actually happened (for outcome)' },
+            },
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'get_league_power_rankings',
+          description:
+            'Composite power ranking for all 10 teams: age score + asset quality + win rate. ' +
+            'Shows each team\'s component scores and overall rank. Best signal on who\'s ascending vs declining.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'auto_generate_trade_pitch',
+          description:
+            'Draft a trade pitch for a player you want. Analyzes the target team\'s positional needs and ' +
+            'your available assets, then writes a structured offer with rationale.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              target_player: { type: 'string', description: 'Player you want to acquire' },
+              target_team: { type: 'string', description: 'Team that owns them (partial name match)' },
+              max_offer_age: { type: 'number', description: 'Max age of players you\'re willing to offer (default: 32)' },
+            },
+            required: ['target_player'],
+            additionalProperties: false,
+          },
+        },
       ],
     }));
 
@@ -475,6 +538,12 @@ class FlatbottomPhil {
             return await this.getLeagueTransactions(request.params.arguments);
           case 'get_matchup':
             return await this.getMatchup(request.params.arguments);
+          case 'evaluate_advice':
+            return await this.evaluateAdvice(request.params.arguments);
+          case 'get_league_power_rankings':
+            return await this.getLeaguePowerRankings();
+          case 'auto_generate_trade_pitch':
+            return await this.autoGenerateTradePitch(request.params.arguments);
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
         }
@@ -2043,6 +2112,290 @@ class FlatbottomPhil {
 
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    };
+  }
+
+  private async evaluateAdvice(args: any) {
+    const action: string = args?.action ?? 'score';
+    const logPath = path.join(DATA_DIR, 'advice_log.json');
+    const log: any[] = fs.existsSync(logPath) ? JSON.parse(fs.readFileSync(logPath, 'utf8')) : [];
+
+    if (action === 'log') {
+      const entry = {
+        id: log.length + 1,
+        date: new Date().toISOString().slice(0, 10),
+        call: args?.call ?? '(no call text)',
+        category: args?.category ?? 'other',
+        players: args?.players ?? [],
+        result: 'tbd',
+        outcome_notes: null,
+      };
+      log.push(entry);
+      fs.writeFileSync(logPath, JSON.stringify(log, null, 2));
+      return { content: [{ type: 'text', text: JSON.stringify({ logged: entry }, null, 2) }] };
+    }
+
+    if (action === 'outcome') {
+      const id: number = args?.advice_id;
+      const entry = log.find((e) => e.id === id);
+      if (!entry) {
+        return { content: [{ type: 'text', text: `No advice entry with id ${id}.` }] };
+      }
+      entry.result = args?.result ?? 'tbd';
+      entry.outcome_notes = args?.outcome_notes ?? null;
+      fs.writeFileSync(logPath, JSON.stringify(log, null, 2));
+      return { content: [{ type: 'text', text: JSON.stringify({ updated: entry }, null, 2) }] };
+    }
+
+    // action === 'score'
+    const scored = log.filter((e) => e.result !== 'tbd');
+    const correct = scored.filter((e) => e.result === 'correct').length;
+    const partial = scored.filter((e) => e.result === 'partial').length;
+    const incorrect = scored.filter((e) => e.result === 'incorrect').length;
+    const total = scored.length;
+    const hitRate = total > 0 ? `${Math.round(((correct + partial * 0.5) / total) * 100)}%` : 'n/a';
+
+    const byCategory: Record<string, { correct: number; partial: number; incorrect: number; tbd: number }> = {};
+    for (const e of log) {
+      if (!byCategory[e.category]) byCategory[e.category] = { correct: 0, partial: 0, incorrect: 0, tbd: 0 };
+      const cat = byCategory[e.category]!;
+      cat[e.result as 'correct' | 'partial' | 'incorrect' | 'tbd']++;
+    }
+
+    const pending = log.filter((e) => e.result === 'tbd');
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          summary: { total_calls: log.length, scored: total, correct, partial, incorrect, hit_rate: hitRate },
+          by_category: byCategory,
+          pending_outcomes: pending.map((e) => ({ id: e.id, date: e.date, call: e.call, players: e.players })),
+          full_log: log,
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async getLeaguePowerRankings() {
+    const ageMap = await this.getAgeMap();
+    const configPath = path.join(DATA_DIR, 'rubric_config.json');
+    const cfg = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, 'utf8')) : {};
+    const top30: string[] = cfg.top_30_bonus_players ?? [];
+    const ageWeights = cfg.age_weights ?? {
+      '22_and_under': 5, '23_to_24': 4, '25_to_26': 3, '27_to_28': 2, '29': 1, '30_plus': 0,
+    };
+
+    // Fetch all rosters + standings in parallel
+    const [allTeams, standingsRes] = await Promise.all([
+      this.fetchLeagueRosters(ageMap),
+      this.yahooApi.get(`/league/${await this.buildLeagueKey()}/standings`, {
+        headers: this.authHeaders(), params: { format: 'json' },
+      }),
+    ]);
+
+    // Build win rate map from standings
+    const winRateMap: Record<string, number> = {};
+    const teamsStandings = standingsRes.data.fantasy_content.league[1].standings[0].teams;
+    for (const [k, v] of Object.entries(teamsStandings) as [string, any][]) {
+      if (k === 'count') continue;
+      const tKey = v.team[0].find((x: any) => x.team_key !== undefined)?.team_key ?? '';
+      const pct = parseFloat(v.team[2]?.team_standings?.outcome_totals?.percentage ?? '0');
+      const wins = parseInt(v.team[2]?.team_standings?.outcome_totals?.wins ?? '0', 10);
+      const losses = parseInt(v.team[2]?.team_standings?.outcome_totals?.losses ?? '0', 10);
+      // Pre-season: no games yet — use 0.5 as neutral baseline
+      winRateMap[tKey] = (wins + losses === 0) ? 0.5 : pct;
+    }
+
+    const rankings: any[] = [];
+
+    for (const team of allTeams) {
+      const ages = team.roster.map((p: any) => p.age).filter((a: any) => a !== null) as number[];
+      if (ages.length === 0) continue;
+
+      const sorted = [...ages].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      const medianAge: number = sorted.length % 2 === 0 ? (sorted[mid - 1]! + sorted[mid]!) / 2 : sorted[mid]!;
+
+      // Age score: invert median age (lower = younger = better for rebuild value; cap at 0)
+      // Scale: median 24 = 10, 26 = 8, 28 = 6, 30 = 4, 32+ = 2
+      const ageScore = Math.max(2, 10 - (medianAge - 24));
+
+      // Asset quality score (same rubric as get_rebuild_scorecard)
+      let assetScore = 0;
+      for (const p of team.roster) {
+        const a: number | null = p.age;
+        if (a === null) continue;
+        let pts = 0;
+        if (a <= 22)      pts = ageWeights['22_and_under'] ?? 5;
+        else if (a <= 24) pts = ageWeights['23_to_24'] ?? 4;
+        else if (a <= 26) pts = ageWeights['25_to_26'] ?? 3;
+        else if (a <= 28) pts = ageWeights['27_to_28'] ?? 2;
+        else if (a <= 29) pts = ageWeights['29'] ?? 1;
+        else              pts = ageWeights['30_plus'] ?? 0;
+        if (top30.some((n) => normalizeName(n) === normalizeName(p.name))) pts += 2;
+        assetScore += pts;
+      }
+      // Normalize asset score to 0-10 (max possible = roster_size * 7)
+      const maxAsset = team.roster.length * 7;
+      const assetNorm = parseFloat(((assetScore / maxAsset) * 10).toFixed(2));
+
+      const winRate = winRateMap[team.teamKey] ?? 0.5;
+      // Composite: 35% age score, 40% asset score, 25% win rate
+      const composite = parseFloat((ageScore * 0.35 + assetNorm * 0.40 + winRate * 10 * 0.25).toFixed(2));
+
+      rankings.push({
+        team: team.teamName,
+        is_my_team: team.isMe,
+        composite_score: composite,
+        age_score: parseFloat(ageScore.toFixed(2)),
+        median_age: parseFloat(medianAge.toFixed(1)),
+        asset_score: assetNorm,
+        raw_asset_pts: assetScore,
+        win_rate: parseFloat(winRate.toFixed(3)),
+      });
+    }
+
+    rankings.sort((a, b) => b.composite_score - a.composite_score);
+    rankings.forEach((r, i) => { r.rank = i + 1; });
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          note: 'Composite = 35% age score + 40% asset quality + 25% win rate. Age score: lower median age = higher score.',
+          rankings,
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async autoGenerateTradePitch(args: any) {
+    const targetPlayer: string = args?.target_player ?? '';
+    const targetTeamFilter: string | undefined = args?.target_team;
+    const maxOfferAge: number = args?.max_offer_age ?? 32;
+
+    const ageMap = await this.getAgeMap();
+    const configPath = path.join(DATA_DIR, 'rubric_config.json');
+    const cfg = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, 'utf8')) : {};
+    const top30: string[] = cfg.top_30_bonus_players ?? [];
+
+    const allTeams = await this.fetchLeagueRosters(ageMap);
+    const myTeam = allTeams.find((t) => t.isMe);
+    if (!myTeam) return { content: [{ type: 'text', text: 'Could not find your team.' }] };
+
+    // Find the target player and their team
+    const targetNorm = normalizeName(targetPlayer);
+    let ownerTeam: any = null;
+    let targetPlayerInfo: any = null;
+
+    for (const team of allTeams) {
+      if (team.isMe) continue;
+      if (targetTeamFilter && !team.teamName.toLowerCase().includes(targetTeamFilter.toLowerCase())) continue;
+      const found = team.roster.find((p: any) => normalizeName(p.name).includes(targetNorm) || targetNorm.includes(normalizeName(p.name)));
+      if (found) {
+        ownerTeam = team;
+        targetPlayerInfo = found;
+        break;
+      }
+    }
+
+    if (!ownerTeam || !targetPlayerInfo) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Could not find "${targetPlayer}" on any opponent roster${targetTeamFilter ? ` (filtered to "${targetTeamFilter}")` : ''}.`,
+        }],
+      };
+    }
+
+    // Analyze the owner team's positional depth to find their thin spots
+    const posDepth: Record<string, number> = {};
+    for (const p of ownerTeam.roster) {
+      for (const b of this.positionBuckets(p.position)) {
+        posDepth[b] = (posDepth[b] ?? 0) + 1;
+      }
+    }
+    const thinSpots = Object.entries(posDepth)
+      .filter(([, cnt]) => cnt <= 2)
+      .map(([pos]) => pos)
+      .sort();
+
+    // Score my roster players as potential offer pieces
+    const myOfferCandidates = myTeam.roster
+      .filter((p: any) => {
+        const age = p.age ?? 99;
+        return age <= maxOfferAge && normalizeName(p.name) !== normalizeName(targetPlayer);
+      })
+      .map((p: any) => {
+        const score = this.scorePlayer(p.name, p.position, p.age, null, top30);
+        const fillsThinSpot = this.positionBuckets(p.position).some((b) => thinSpots.includes(b));
+        return { ...p, score: score.total, fills_need: fillsThinSpot };
+      })
+      .sort((a: any, b: any) => {
+        // Prioritize players that fill a thin spot, then by score descending
+        if (a.fills_need !== b.fills_need) return a.fills_need ? -1 : 1;
+        return b.score - a.score;
+      });
+
+    // Score the target player
+    const targetScore = this.scorePlayer(
+      targetPlayerInfo.name,
+      targetPlayerInfo.position,
+      targetPlayerInfo.age,
+      null,
+      top30
+    );
+
+    // Build the offer: pick top candidates whose combined score ≥ target score
+    const offer: any[] = [];
+    let offerTotal = 0;
+    for (const candidate of myOfferCandidates) {
+      if (offerTotal >= targetScore.total * 0.85) break; // don't over-offer
+      offer.push(candidate);
+      offerTotal += candidate.score;
+      if (offerTotal >= targetScore.total) break;
+    }
+
+    // Build the pitch narrative
+    const needsPhrase = thinSpots.length > 0
+      ? `Their roster is thin at ${thinSpots.join(', ')}.`
+      : 'Their roster looks balanced — lead with the age/upside angle.';
+
+    const offerNames = offer.map((p: any) => `${p.name} (${p.position}, age ${p.age ?? '?'})`).join(', ');
+    const pitch = [
+      `Target: ${targetPlayerInfo.name} (${targetPlayerInfo.position}, age ${targetPlayerInfo.age ?? '?'}) from ${ownerTeam.teamName}.`,
+      ``,
+      `Pitch: Offer ${offerNames}.`,
+      ``,
+      `Why they take it:`,
+      `- ${needsPhrase}`,
+      `- Your offer fills a need${offer.some((p: any) => p.fills_need) ? ' directly (position match)' : ' with value they can use'}.`,
+      ``,
+      `Why you take it:`,
+      `- ${targetPlayerInfo.name} at age ${targetPlayerInfo.age ?? '?'} fits your rebuild timeline.`,
+      `- Reduces your median age while adding ${targetScore.adp_tier} talent.`,
+      ``,
+      `Value check: Target score ${targetScore.total.toFixed(1)} vs offer total ${offerTotal.toFixed(1)} — ${
+        offerTotal >= targetScore.total ? 'fair or slightly in their favor (they should take this)' :
+        offerTotal >= targetScore.total * 0.85 ? 'slightly under — mention upside angle' :
+        'under market — consider adding a piece'
+      }.`,
+    ].join('\n');
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          pitch,
+          target: { name: targetPlayerInfo.name, position: targetPlayerInfo.position, age: targetPlayerInfo.age, score: targetScore.total, tier: targetScore.adp_tier },
+          owner_team: ownerTeam.teamName,
+          their_thin_spots: thinSpots,
+          your_offer: offer.map((p: any) => ({ name: p.name, position: p.position, age: p.age, score: p.score, fills_need: p.fills_need })),
+          offer_total_score: parseFloat(offerTotal.toFixed(2)),
+          target_score: targetScore.total,
+        }, null, 2),
+      }],
     };
   }
 

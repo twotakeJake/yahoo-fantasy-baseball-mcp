@@ -9,7 +9,7 @@ Age data is pulled live from the **MLB Stats API** and cross-referenced by name 
 
 ---
 
-## Available Tools (21)
+## Available Tools (22)
 
 ### Roster & Wire
 
@@ -17,6 +17,7 @@ Age data is pulled live from the **MLB Stats API** and cross-referenced by name 
 |---|---|
 | `get_team_roster` | Current roster with position, slot, and MLB team |
 | `get_waiver_wire_targets` | Available free agents filtered by age, sorted by ADP. Tagged *lotto ticket* (≤24) or *target* (25–29) |
+| `find_free_agents` | Roster-aware wire finder. Detects your positional thin spots and surfaces available players that fill those gaps, sorted by ADP. Filter to a specific position or scan all thin spots at once |
 | `get_waiver_wire_delta` | What changed on the wire since the last scan — newly available and newly claimed players |
 | `get_prospect_overlap` | Cross-references your roster and wire against recently debuted young players (age ≤25, debuted 2024+) |
 

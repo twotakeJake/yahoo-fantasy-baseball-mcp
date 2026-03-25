@@ -481,6 +481,23 @@ class FlatbottomPhil {
           },
         },
         {
+          name: 'find_free_agents',
+          description:
+            'Roster-aware waiver wire finder. Identifies your positional thin spots, then surfaces ' +
+            'available free agents that fill those gaps — sorted by ADP within each needed position. ' +
+            'Optionally filter to a specific position (e.g. "SP", "C", "SS").',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              position: { type: 'string', description: 'Filter to a specific position (e.g. "SP", "C", "SS"). Omit to scan all thin spots.' },
+              max_age: { type: 'number', description: 'Max player age to include (default: 29)' },
+              count: { type: 'number', description: 'Number of wire players to scan (default: 100)' },
+              depth_threshold: { type: 'number', description: 'Max roster count at a position before it\'s no longer considered thin (default: 3)' },
+            },
+            additionalProperties: false,
+          },
+        },
+        {
           name: 'auto_generate_trade_pitch',
           description:
             'Draft a trade pitch with floor/target/ceiling offer tiers and live ADP scoring. ' +
@@ -544,6 +561,8 @@ class FlatbottomPhil {
             return await this.getLeagueTransactions(request.params.arguments);
           case 'get_matchup':
             return await this.getMatchup(request.params.arguments);
+          case 'find_free_agents':
+            return await this.findFreeAgents(request.params.arguments);
           case 'evaluate_advice':
             return await this.evaluateAdvice(request.params.arguments);
           case 'get_league_power_rankings':
@@ -2520,6 +2539,109 @@ class FlatbottomPhil {
             ceiling: { players: ceilingOffer.players.map((p: any) => ({ name: p.name, position: p.position, age: p.age, adp: p.adp, score: p.score })), total: ceilingOffer.total },
           },
           scoring_note: 'Scores use live ADP from Yahoo draft analysis. Higher = more valuable.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async findFreeAgents(args: any) {
+    const posFilter: string | undefined = args?.position?.toUpperCase();
+    const maxAge: number = args?.max_age ?? 29;
+    const count: number = args?.count ?? 100;
+    const depthThreshold: number = args?.depth_threshold ?? 3;
+
+    const [leagueKey, teamKey, ageMap] = await Promise.all([
+      this.buildLeagueKey(), this.buildTeamKey(), this.getAgeMap(),
+    ]);
+
+    // Fetch my roster and compute positional depth
+    const rosterRes = await this.yahooApi.get(`/team/${teamKey}/roster/players`, {
+      headers: this.authHeaders(), params: { format: 'json' },
+    });
+    const rosterPlayers = extractPlayersMap(rosterRes.data.fantasy_content.team[1].roster);
+    const myRoster = Object.entries(rosterPlayers)
+      .filter(([k]) => k !== 'count')
+      .map(([, v]: [string, any]) => parsePlayerInfo(v.player[0]));
+
+    const posDepth: Record<string, number> = {};
+    for (const p of myRoster) {
+      for (const b of this.positionBuckets(p.position)) {
+        posDepth[b] = (posDepth[b] ?? 0) + 1;
+      }
+    }
+
+    // Determine which positions are thin
+    const allPositions = ['C', '1B', '2B', '3B', 'SS', 'OF', 'SP', 'RP'];
+    let thinPositions: string[];
+    if (posFilter) {
+      thinPositions = [posFilter];
+    } else {
+      thinPositions = allPositions.filter((pos) => (posDepth[pos] ?? 0) < depthThreshold);
+    }
+
+    if (thinPositions.length === 0) {
+      return { content: [{ type: 'text', text: 'No thin positions found on your roster at this depth threshold.' }] };
+    }
+
+    // Scan waiver wire
+    const wireRes = await this.yahooApi.get(
+      `/league/${leagueKey}/players;status=A;count=${count};sort=AR;out=draft_analysis`,
+      { headers: this.authHeaders(), params: { format: 'json' } }
+    );
+
+    const playersData = wireRes.data.fantasy_content.league[1].players;
+    const byPosition: Record<string, any[]> = {};
+
+    for (const [k, v] of Object.entries(playersData) as [string, any][]) {
+      if (k === 'count') continue;
+      const playerArr = v.player;
+      const info = parsePlayerInfo(playerArr[0]);
+      const adpRaw = playerArr[1]?.draft_analysis?.average_pick;
+      const adp = adpRaw ? parseFloat(adpRaw) : null;
+      const age = lookupAge(ageMap, info.name, info.jerseyNumber);
+
+      if (age === undefined || age > maxAge) continue;
+
+      const playerBuckets = this.positionBuckets(info.position);
+      const filledNeeds = playerBuckets.filter((b) => thinPositions.includes(b));
+      if (filledNeeds.length === 0) continue;
+
+      const entry = {
+        name: info.name,
+        position: info.position,
+        mlbTeam: info.mlbTeam,
+        age,
+        adp: adp && !isNaN(adp) ? adp : null,
+        fills: filledNeeds,
+        tag: age <= 24 ? 'lotto ticket' : 'target',
+      };
+
+      for (const need of filledNeeds) {
+        if (!byPosition[need]) byPosition[need] = [];
+        byPosition[need].push(entry);
+      }
+    }
+
+    // Sort each bucket by ADP ascending
+    for (const pos of Object.keys(byPosition)) {
+      byPosition[pos]!.sort((a, b) => (a.adp ?? 9999) - (b.adp ?? 9999));
+    }
+
+    const rosterDepthSummary: Record<string, number> = {};
+    for (const pos of allPositions) rosterDepthSummary[pos] = posDepth[pos] ?? 0;
+
+    const totalFound = Object.values(byPosition).reduce((s, arr) => s + arr.length, 0);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          summary: `${totalFound} wire targets found filling ${thinPositions.length} thin position(s): ${thinPositions.join(', ')}`,
+          roster_depth: rosterDepthSummary,
+          thin_positions: thinPositions,
+          depth_threshold: depthThreshold,
+          targets_by_position: byPosition,
+          note: 'Sorted by ADP within each position. lotto ticket = age ≤24, target = 25–29.',
         }, null, 2),
       }],
     };

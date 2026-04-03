@@ -53,6 +53,26 @@ class FlatbottomPhil {
       baseURL: 'https://statsapi.mlb.com/api/v1',
     });
 
+    // Instrument API call timings → stderr
+    for (const [label, instance] of [['Yahoo', this.yahooApi], ['MLB', this.mlbApi]] as const) {
+      instance.interceptors.request.use((config) => {
+        (config as any)._t = performance.now();
+        return config;
+      });
+      instance.interceptors.response.use(
+        (res) => {
+          const ms = Math.round(performance.now() - (res.config as any)._t);
+          console.error(`[${label}] ${res.config.method?.toUpperCase()} ${res.config.url} → ${res.status} (${ms}ms)`);
+          return res;
+        },
+        (err) => {
+          const ms = err.config?._t ? Math.round(performance.now() - err.config._t) : '?';
+          console.error(`[${label}] ${err.config?.method?.toUpperCase()} ${err.config?.url} → ERR ${err.response?.status ?? err.code} (${ms}ms)`);
+          return Promise.reject(err);
+        }
+      );
+    }
+
     this.setupToolHandlers();
     this.setupTokenRefresh();
 
@@ -148,11 +168,12 @@ class FlatbottomPhil {
       tools: [
         {
           name: 'get_team_roster',
-          description: 'Get the current roster with position and slot info',
+          description: 'Get the current roster with position and slot info. Pass a date (YYYY-MM-DD) to see a future or past roster — useful for checking how pending waivers will land.',
           inputSchema: {
             type: 'object',
             properties: {
               team_key: { type: 'string', description: 'Yahoo team key (optional)' },
+              date: { type: 'string', description: 'Date in YYYY-MM-DD format (optional, defaults to today)' },
             },
             additionalProperties: false,
           },
@@ -523,8 +544,10 @@ class FlatbottomPhil {
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const toolStart = performance.now();
+      const toolName = request.params.name;
       try {
-        switch (request.params.name) {
+        switch (toolName) {
           case 'get_team_roster':
             return await this.getTeamRoster(request.params.arguments);
           case 'get_waiver_wire_targets':
@@ -574,6 +597,7 @@ class FlatbottomPhil {
         }
       } catch (error) {
         if (axios.isAxiosError(error)) {
+          console.error(`[Tool] ${toolName} → ERR ${error.response?.status ?? error.code} (${Math.round(performance.now() - toolStart)}ms)`);
           return {
             content: [
               {
@@ -585,6 +609,9 @@ class FlatbottomPhil {
           };
         }
         throw error;
+      } finally {
+        // Logs total wall time for every successful tool call
+        console.error(`[Tool] ${toolName} completed in ${Math.round(performance.now() - toolStart)}ms`);
       }
     });
   }
@@ -593,7 +620,8 @@ class FlatbottomPhil {
 
   private async getTeamRoster(args: any) {
     const teamKey = args?.team_key ?? (await this.buildTeamKey());
-    const res = await this.yahooApi.get(`/team/${teamKey}/roster/players`, {
+    const dateSuffix = args?.date ? `;date=${args.date}` : '';
+    const res = await this.yahooApi.get(`/team/${teamKey}/roster${dateSuffix}/players`, {
       headers: this.authHeaders(),
       params: { format: 'json' },
     });

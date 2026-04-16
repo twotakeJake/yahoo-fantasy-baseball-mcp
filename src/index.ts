@@ -12,7 +12,7 @@ import { config } from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { normalizeName, lookupAge, extractField, parsePlayerInfo, extractPlayersMap } from './utils/transforms.js';
+import { normalizeName, lookupAge, extractField, parsePlayerInfo, extractPlayersMap, computeCategoryRankings, buildOptimalLineup } from './utils/transforms.js';
 
 config();
 
@@ -519,6 +519,103 @@ class FlatbottomPhil {
           },
         },
         {
+          name: 'get_player_news',
+          description:
+            'Fetch recent MLB news headlines for one or more players from the MLB.com RSS feed. ' +
+            'Pass a player name (or comma-separated list) and get back matching headlines with dates. ' +
+            'Note: these are MLB.com editorial headlines, not Rotowire fantasy blurbs.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              players: {
+                type: 'string',
+                description: 'Player name or comma-separated list of names (e.g. "Ohtani" or "Ohtani, Messick, Adell")',
+              },
+            },
+            required: ['players'],
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'get_opponent_scouting',
+          description:
+            'Deep dive on your current week\'s matchup opponent. ' +
+            'Returns their full roster with injury flags, season category ranks vs the rest of the league, ' +
+            'and which categories to attack (they\'re weak) vs defend (they\'re strong).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              week: { type: 'number', description: 'Scoring week to scout (default: current week)' },
+            },
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'set_lineup',
+          description:
+            'Optimize and push your lineup to Yahoo for a given date. ' +
+            'Auto-assigns injured IL-eligible players to IL slots, fills active positions with healthy players (most-constrained first), ' +
+            'and benches the rest. Use dry_run=true to preview assignments before committing.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              date: { type: 'string', description: 'Date to set lineup for in YYYY-MM-DD format (default: today)' },
+              dry_run: { type: 'boolean', description: 'Preview assignments without pushing to Yahoo (default: false)' },
+            },
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'get_faab_budget',
+          description:
+            'Your remaining FAAB budget and how it compares to other league teams. ' +
+            'Also shows waiver priority if the league uses priority-based waivers instead of FAAB.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'get_roster_injury_sweep',
+          description:
+            'Sweeps your entire roster for injury flags. ' +
+            'Returns currently injured players, newly flagged since the last check, and recently cleared. ' +
+            'Saves a snapshot each run so the delta is always fresh.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'get_category_standings',
+          description:
+            'Ranks all league teams category-by-category using season-to-date stats. ' +
+            'Shows your rank in each scoring category, highlights your strengths and weaknesses, ' +
+            'and prints the full league table per stat. Essential for knowing where to stream.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'get_pitcher_starts',
+          description:
+            'Shows which of your rostered pitchers are scheduled to start over the next N days, ' +
+            'with opponent, home/away, and date. Defaults to 7 days. ' +
+            'Use this for streaming decisions and to count starts remaining in the scoring week.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              days: { type: 'number', description: 'Number of days to look ahead including today (default: 7)' },
+              date: { type: 'string', description: 'Start date in YYYY-MM-DD format (default: today)' },
+            },
+            additionalProperties: false,
+          },
+        },
+        {
           name: 'auto_generate_trade_pitch',
           description:
             'Draft a trade pitch with floor/target/ceiling offer tiers and live ADP scoring. ' +
@@ -592,6 +689,20 @@ class FlatbottomPhil {
             return await this.getLeaguePowerRankings();
           case 'auto_generate_trade_pitch':
             return await this.autoGenerateTradePitch(request.params.arguments);
+          case 'get_player_news':
+            return await this.getPlayerNews(request.params.arguments);
+          case 'get_opponent_scouting':
+            return await this.getOpponentScouting(request.params.arguments);
+          case 'set_lineup':
+            return await this.setLineup(request.params.arguments);
+          case 'get_faab_budget':
+            return await this.getFaabBudget();
+          case 'get_roster_injury_sweep':
+            return await this.getRosterInjurySweep();
+          case 'get_category_standings':
+            return await this.getCategoryStandings();
+          case 'get_pitcher_starts':
+            return await this.getPitcherStarts(request.params.arguments);
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
         }
@@ -671,6 +782,8 @@ class FlatbottomPhil {
         name: info.name,
         position: info.position,
         mlbTeam: info.mlbTeam,
+        ...(info.status ? { status: info.status } : {}),
+        ...(info.injuryNote ? { injuryNote: info.injuryNote } : {}),
         age,
         adp: adp && !isNaN(adp) ? adp : null,
         tag: age <= 24 ? 'lotto ticket' : 'target',
@@ -2045,9 +2158,10 @@ class FlatbottomPhil {
     for (const [k, v] of Object.entries(txData) as [string, any][]) {
       if (k === 'count') continue;
       const tx = v.transaction[0];
-      const type = extractField(tx, 'type') ?? '?';
-      const status = extractField(tx, 'status') ?? '?';
-      const timestampRaw = extractField(tx, 'timestamp');
+      const txArr = Array.isArray(tx) ? tx : Object.values(tx);
+      const type = extractField(txArr, 'type') ?? tx?.type ?? '?';
+      const status = extractField(txArr, 'status') ?? tx?.status ?? '?';
+      const timestampRaw = extractField(txArr, 'timestamp') ?? tx?.timestamp;
       const timestamp = timestampRaw
         ? new Date(Number(timestampRaw) * 1000).toISOString().slice(0, 10)
         : '?';
@@ -2088,8 +2202,9 @@ class FlatbottomPhil {
       params: { format: 'json' },
     });
     const leagueSettings = settingsRes.data.fantasy_content.league;
+    const leagueSettingsArr = Array.isArray(leagueSettings[0]) ? leagueSettings[0] : Object.values(leagueSettings[0]);
     const currentWeek: number = args?.week
-      ?? Number(extractField(leagueSettings[0], 'current_week') ?? 1);
+      ?? Number(extractField(leagueSettingsArr, 'current_week') ?? leagueSettings[0]?.current_week ?? 1);
 
     // Fetch scoreboard for the requested week
     const sbRes = await this.yahooApi.get(`/league/${leagueKey}/scoreboard;week=${currentWeek}`, {
@@ -2349,6 +2464,61 @@ class FlatbottomPhil {
       total += c.score;
     }
     return { players: offer, total: parseFloat(total.toFixed(2)) };
+  }
+
+  private async getPlayerNews(args: any) {
+    const playerNames: string[] = (args.players as string)
+      .split(',')
+      .map((s: string) => s.trim().toLowerCase())
+      .filter(Boolean);
+
+    const rssRes = await axios.get('https://www.mlb.com/feeds/news/rss.xml', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FlatbottomPhil/1.0)' },
+      timeout: 10000,
+    });
+
+    const xml: string = rssRes.data;
+
+    // Parse <item> blocks from RSS XML
+    const itemPattern = /<item>([\s\S]*?)<\/item>/g;
+    const titlePattern = /<title><!\[CDATA\[(.*?)\]\]><\/title>|<title>(.*?)<\/title>/;
+    const linkPattern = /<link>(.*?)<\/link>/;
+    const pubDatePattern = /<pubDate>(.*?)<\/pubDate>/;
+    const descPattern = /<description><!\[CDATA\[(.*?)\]\]><\/description>|<description>(.*?)<\/description>/;
+
+    const results: Record<string, any[]> = {};
+    for (const name of playerNames) results[name] = [];
+
+    let match: RegExpExecArray | null;
+    while ((match = itemPattern.exec(xml)) !== null) {
+      const block = match[1]!;
+      const titleMatch = titlePattern.exec(block);
+      const title = (titleMatch?.[1] ?? titleMatch?.[2] ?? '').trim();
+      const linkMatch = linkPattern.exec(block);
+      const link = (linkMatch?.[1] ?? '').trim();
+      const pubDateMatch = pubDatePattern.exec(block);
+      const pubDate = (pubDateMatch?.[1] ?? '').trim();
+      const descMatch = descPattern.exec(block);
+      const description = (descMatch?.[1] ?? descMatch?.[2] ?? '').trim();
+
+      const titleLower = title.toLowerCase();
+      for (const name of playerNames) {
+        // Match on last name or full name substring
+        const lastWord = name.split(' ').pop() ?? name;
+        if (titleLower.includes(lastWord)) {
+          results[name]!.push({ title, description: description || null, link, pubDate });
+        }
+      }
+    }
+
+    const output: any = {};
+    for (const name of playerNames) {
+      output[name] = results[name]!.length > 0 ? results[name] : 'No recent MLB.com headlines found.';
+    }
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ source: 'MLB.com RSS', results: output }, null, 2) }],
+    };
   }
 
   private async autoGenerateTradePitch(args: any) {
@@ -2634,10 +2804,12 @@ class FlatbottomPhil {
       const filledNeeds = playerBuckets.filter((b) => thinPositions.includes(b));
       if (filledNeeds.length === 0) continue;
 
-      const entry = {
+      const entry: any = {
         name: info.name,
         position: info.position,
         mlbTeam: info.mlbTeam,
+        ...(info.status ? { status: info.status } : {}),
+        ...(info.injuryNote ? { injuryNote: info.injuryNote } : {}),
         age,
         adp: adp && !isNaN(adp) ? adp : null,
         fills: filledNeeds,
@@ -2670,6 +2842,582 @@ class FlatbottomPhil {
           depth_threshold: depthThreshold,
           targets_by_position: byPosition,
           note: 'Sorted by ADP within each position. lotto ticket = age ≤24, target = 25–29.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async getOpponentScouting(args: any) {
+    const leagueKey = await this.buildLeagueKey();
+    const myTeamKey = await this.buildTeamKey();
+
+    // Fetch settings (current week + stat categories)
+    const settingsRes = await this.yahooApi.get(`/league/${leagueKey}/settings`, {
+      headers: this.authHeaders(),
+      params: { format: 'json' },
+    });
+    const leagueSettings = settingsRes.data.fantasy_content.league;
+    const leagueSettingsArr = Array.isArray(leagueSettings[0]) ? leagueSettings[0] : Object.values(leagueSettings[0]);
+    const currentWeek: number = args?.week
+      ?? Number(extractField(leagueSettingsArr, 'current_week') ?? leagueSettings[0]?.current_week ?? 1);
+    const statSettings: any[] = leagueSettings[1]?.settings?.[0]?.stat_categories?.stats ?? [];
+    const categories = statSettings.map((s: any) => ({
+      stat_id: String(s.stat.stat_id),
+      abbr: s.stat.abbr ?? s.stat.display_name ?? String(s.stat.stat_id),
+      higherIsBetter: s.stat.sort_order !== '-1' && s.stat.sort_order !== -1,
+    }));
+
+    // Find opponent from scoreboard
+    const sbRes = await this.yahooApi.get(`/league/${leagueKey}/scoreboard;week=${currentWeek}`, {
+      headers: this.authHeaders(),
+      params: { format: 'json' },
+    });
+    const matchups = sbRes.data.fantasy_content.league[1].scoreboard[0].matchups;
+    let opponentTeamKey: string | null = null;
+    let opponentName = '?';
+
+    for (const [k, v] of Object.entries(matchups) as [string, any][]) {
+      if (k === 'count') continue;
+      const teamsObj = v.matchup[0].teams;
+      const teamInfos: { key: string; name: string }[] = [];
+      for (const [tk, tv] of Object.entries(teamsObj) as [string, any][]) {
+        if (tk === 'count') continue;
+        const arr = tv.team[0];
+        teamInfos.push({
+          key: arr.find((x: any) => x.team_key !== undefined)?.team_key ?? '',
+          name: arr.find((x: any) => x.name !== undefined)?.name ?? '?',
+        });
+      }
+      if (teamInfos.some((t) => t.key === myTeamKey)) {
+        const opp = teamInfos.find((t) => t.key !== myTeamKey);
+        opponentTeamKey = opp?.key ?? null;
+        opponentName = opp?.name ?? '?';
+        break;
+      }
+    }
+
+    if (!opponentTeamKey) {
+      return { content: [{ type: 'text', text: `No matchup found for week ${currentWeek}.` }] };
+    }
+
+    // Fetch opponent roster + all teams' season stats in parallel
+    const [rosterRes, allTeamsRes] = await Promise.all([
+      this.yahooApi.get(`/team/${opponentTeamKey}/roster/players`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+      this.yahooApi.get(`/league/${leagueKey}/teams;out=stats`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+    ]);
+
+    // Parse opponent roster
+    const rosterObj = rosterRes.data.fantasy_content.team[1].roster;
+    const playersMap = extractPlayersMap(rosterObj);
+    const roster: any[] = [];
+    const injuredPlayers: any[] = [];
+
+    for (const [k, v] of Object.entries(playersMap) as [string, any][]) {
+      if (k === 'count') continue;
+      const info = parsePlayerInfo(v.player[0]);
+      const entry: any = { name: info.name, position: info.position, mlbTeam: info.mlbTeam };
+      if (info.status) entry.status = info.status;
+      if (info.injuryNote) entry.injuryNote = info.injuryNote;
+      roster.push(entry);
+      if (info.status || info.injuryNote) injuredPlayers.push(entry);
+    }
+
+    // Parse all teams' season stats for category ranking
+    const teamsData = allTeamsRes.data.fantasy_content.league[1].teams;
+    const allTeamStats: { teamKey: string; stats: Record<string, string> }[] = [];
+
+    for (const [k, v] of Object.entries(teamsData) as [string, any][]) {
+      if (k === 'count') continue;
+      const teamArr = v.team[0];
+      const statsArr = v.team[1]?.team_stats?.stats ?? [];
+      const teamKey = teamArr.find((x: any) => x.team_key !== undefined)?.team_key ?? '';
+      const statMap: Record<string, string> = {};
+      for (const s of statsArr) {
+        if (s.stat) statMap[String(s.stat.stat_id)] = s.stat.value ?? '';
+      }
+      allTeamStats.push({ teamKey, stats: statMap });
+    }
+
+    const n = allTeamStats.length;
+    const categoryAnalysis: any[] = [];
+
+    for (const cat of categories) {
+      const inputs = allTeamStats.map((t) => {
+        const raw = t.stats[cat.stat_id];
+        const parsed = raw !== undefined && raw !== '-' && raw !== '' ? parseFloat(raw) : null;
+        return { teamKey: t.teamKey, value: parsed };
+      });
+      const ranked = computeCategoryRankings(inputs, cat.higherIsBetter);
+      const myEntry = ranked.find((r) => r.teamKey === myTeamKey);
+      const oppEntry = ranked.find((r) => r.teamKey === opponentTeamKey);
+      const oppStats = allTeamStats.find((t) => t.teamKey === opponentTeamKey);
+      const myStats = allTeamStats.find((t) => t.teamKey === myTeamKey);
+
+      if (!oppEntry) continue;
+      categoryAnalysis.push({
+        stat: cat.abbr,
+        opp_rank: oppEntry.rank,
+        opp_value: oppStats?.stats[cat.stat_id] ?? '—',
+        my_rank: myEntry?.rank ?? null,
+        my_value: myStats?.stats[cat.stat_id] ?? '—',
+        of: n,
+        higher_is_better: cat.higherIsBetter,
+      });
+    }
+
+    const attack = categoryAnalysis
+      .filter((c) => c.opp_rank >= Math.floor(n * 0.6) + 1)
+      .map((c) => c.stat);
+    const defend = categoryAnalysis
+      .filter((c) => c.opp_rank <= Math.ceil(n * 0.3))
+      .map((c) => c.stat);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          week: currentWeek,
+          opponent: opponentName,
+          roster_health: {
+            total: roster.length,
+            injured_count: injuredPlayers.length,
+            injured: injuredPlayers,
+            full_roster: roster,
+          },
+          category_analysis: categoryAnalysis,
+          attack_categories: attack,
+          defend_categories: defend,
+          note: 'attack = opponent bottom 40% in that category season-to-date. defend = they\'re top 30%.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async setLineup(args: any) {
+    const date: string = args?.date ?? new Date().toISOString().slice(0, 10);
+    const dryRun: boolean = args?.dry_run ?? false;
+    const leagueKey = await this.buildLeagueKey();
+    const teamKey = await this.buildTeamKey();
+
+    // Fetch settings for slot configuration and roster simultaneously
+    const [settingsRes, rosterRes] = await Promise.all([
+      this.yahooApi.get(`/league/${leagueKey}/settings`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+      this.yahooApi.get(`/team/${teamKey}/roster;date=${date}/players`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+    ]);
+
+    // Parse slot configuration from league settings
+    const rosterPosList: any[] = settingsRes.data.fantasy_content.league[1]?.settings?.[0]?.roster_positions ?? [];
+    const slotCounts: Record<string, number> = {};
+    for (const rp of rosterPosList) {
+      if (rp.roster_position?.position && rp.roster_position?.count) {
+        const pos: string = rp.roster_position.position;
+        const cnt: number = Number(rp.roster_position.count);
+        slotCounts[pos] = (slotCounts[pos] ?? 0) + cnt;
+      }
+    }
+
+    // Parse roster — player keys, eligible positions, injury status
+    const rosterObj = rosterRes.data.fantasy_content.team[1].roster;
+    const playersMap = extractPlayersMap(rosterObj);
+    const IL_SLOTS = ['IL', 'IL+', 'NA'];
+
+    type PlayerInput = { playerKey: string; name: string; eligiblePositions: string[]; isInjured: boolean };
+    const players: PlayerInput[] = [];
+
+    for (const [k, v] of Object.entries(playersMap) as [string, any][]) {
+      if (k === 'count') continue;
+      const infoArr: any[] = v.player[0];
+      const info = parsePlayerInfo(infoArr);
+      const eligRaw = extractField(infoArr, 'eligible_positions');
+      const eligiblePositions: string[] = Array.isArray(eligRaw)
+        ? eligRaw.map((e: any) => e?.position).filter(Boolean)
+        : [];
+      players.push({
+        playerKey: info.playerKey,
+        name: info.name,
+        eligiblePositions,
+        isInjured: !!(info.status || info.injuryNote),
+      });
+    }
+
+    const assignments = buildOptimalLineup(players, slotCounts, IL_SLOTS);
+
+    const summary = assignments.map((a) => ({
+      name: players.find((p) => p.playerKey === a.playerKey)?.name ?? a.playerKey,
+      playerKey: a.playerKey,
+      position: a.position,
+    }));
+
+    if (dryRun) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            dry_run: true,
+            date,
+            proposed_lineup: summary,
+            slot_config: slotCounts,
+            note: 'Set dry_run=false to push this lineup to Yahoo.',
+          }, null, 2),
+        }],
+      };
+    }
+
+    // Build XML and PUT to Yahoo
+    const playersXml = assignments
+      .map((a) => `\n      <player>\n        <player_key>${a.playerKey}</player_key>\n        <position>${a.position}</position>\n      </player>`)
+      .join('');
+
+    const xml = `<?xml version="1.0"?>\n<fantasy_content>\n  <roster>\n    <coverage_type>date</coverage_type>\n    <date>${date}</date>\n    <players>${playersXml}\n    </players>\n  </roster>\n</fantasy_content>`;
+
+    await this.yahooApi.put(`/team/${teamKey}/roster`, xml, {
+      headers: { ...this.authHeaders(), 'Content-Type': 'application/xml' },
+      params: { format: 'json' },
+    });
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          date,
+          assignments_made: assignments.length,
+          lineup: summary,
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async getFaabBudget() {
+    const leagueKey = await this.buildLeagueKey();
+    const myTeamKey = await this.buildTeamKey();
+
+    const teamsRes = await this.yahooApi.get(`/league/${leagueKey}/teams`, {
+      headers: this.authHeaders(),
+      params: { format: 'json' },
+    });
+
+    const teamsData = teamsRes.data.fantasy_content.league[1].teams;
+    const allTeams: any[] = [];
+    let myTeam: any = null;
+
+    for (const [k, v] of Object.entries(teamsData) as [string, any][]) {
+      if (k === 'count') continue;
+      const teamArr: any[] = v.team[0];
+      const teamKey = teamArr.find((x: any) => x.team_key !== undefined)?.team_key ?? '';
+      const name = teamArr.find((x: any) => x.name !== undefined)?.name ?? '?';
+      const faabBalance = teamArr.find((x: any) => x.faab_balance !== undefined)?.faab_balance ?? null;
+      const waiverPriority = teamArr.find((x: any) => x.waiver_priority !== undefined)?.waiver_priority ?? null;
+
+      const entry = { teamKey, name, faab_balance: faabBalance !== null ? Number(faabBalance) : null, waiver_priority: waiverPriority };
+      allTeams.push(entry);
+      if (teamKey === myTeamKey) myTeam = entry;
+    }
+
+    // Sort by FAAB descending (nulls last), then by waiver priority ascending
+    const useFaab = allTeams.some((t) => t.faab_balance !== null);
+    if (useFaab) {
+      allTeams.sort((a, b) => (b.faab_balance ?? -1) - (a.faab_balance ?? -1));
+    } else {
+      allTeams.sort((a, b) => (a.waiver_priority ?? 99) - (b.waiver_priority ?? 99));
+    }
+
+    if (!useFaab) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            waiver_type: 'priority',
+            my_waiver_priority: myTeam?.waiver_priority ?? null,
+            league_waiver_order: allTeams.map((t) => ({ name: t.name, waiver_priority: t.waiver_priority, is_my_team: t.teamKey === myTeamKey })),
+            note: 'This league uses priority-based waivers, not FAAB.',
+          }, null, 2),
+        }],
+      };
+    }
+
+    const myRank = allTeams.findIndex((t) => t.teamKey === myTeamKey) + 1;
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          waiver_type: 'faab',
+          my_faab_balance: myTeam?.faab_balance ?? null,
+          my_rank: myRank,
+          of: allTeams.length,
+          league_faab_standings: allTeams.map((t) => ({ name: t.name, faab_balance: t.faab_balance, is_my_team: t.teamKey === myTeamKey })),
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async getRosterInjurySweep() {
+    const snapshotPath = path.join(DATA_DIR, 'injury_snapshot.json');
+    type SnapEntry = { name: string; status: string; injuryNote: string; flaggedDate: string };
+    const previous: Record<string, SnapEntry> = fs.existsSync(snapshotPath)
+      ? JSON.parse(fs.readFileSync(snapshotPath, 'utf8'))
+      : {};
+
+    const teamKey = await this.buildTeamKey();
+    const res = await this.yahooApi.get(`/team/${teamKey}/roster/players`, {
+      headers: this.authHeaders(),
+      params: { format: 'json' },
+    });
+
+    const rosterObj = res.data.fantasy_content.team[1].roster;
+    const playersMap = extractPlayersMap(rosterObj);
+    const today = new Date().toISOString().slice(0, 10);
+
+    const current: Record<string, SnapEntry> = {};
+    const currentlyInjured: any[] = [];
+    const newlyFlagged: any[] = [];
+    const recentlyCleared: any[] = [];
+
+    for (const [k, v] of Object.entries(playersMap) as [string, any][]) {
+      if (k === 'count') continue;
+      const info = parsePlayerInfo(v.player[0]);
+      if (!info.playerKey) continue;
+
+      const hasInjury = !!(info.status || info.injuryNote);
+      const prev = previous[info.playerKey];
+
+      if (hasInjury) {
+        current[info.playerKey] = {
+          name: info.name,
+          status: info.status ?? '',
+          injuryNote: info.injuryNote ?? '',
+          flaggedDate: prev?.flaggedDate ?? today,
+        };
+        const entry = {
+          name: info.name,
+          position: info.position,
+          mlbTeam: info.mlbTeam,
+          status: info.status ?? null,
+          injuryNote: info.injuryNote ?? null,
+          flaggedDate: current[info.playerKey]!.flaggedDate,
+        };
+        currentlyInjured.push(entry);
+        if (!prev) newlyFlagged.push(entry);
+      } else if (prev) {
+        recentlyCleared.push({
+          name: info.name,
+          position: info.position,
+          mlbTeam: info.mlbTeam,
+          previousStatus: prev.status || null,
+          flaggedDate: prev.flaggedDate,
+          clearedDate: today,
+        });
+      }
+    }
+
+    fs.writeFileSync(snapshotPath, JSON.stringify(current, null, 2));
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          as_of: today,
+          total_injured: currentlyInjured.length,
+          newly_flagged: newlyFlagged,
+          currently_injured: currentlyInjured,
+          recently_cleared: recentlyCleared,
+          note: 'Status sourced from Yahoo Fantasy. Run daily for accurate new/cleared deltas.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async getCategoryStandings() {
+    const leagueKey = await this.buildLeagueKey();
+    const myTeamKey = await this.buildTeamKey();
+
+    const [settingsRes, teamsRes] = await Promise.all([
+      this.yahooApi.get(`/league/${leagueKey}/settings`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+      this.yahooApi.get(`/league/${leagueKey}/teams;out=stats`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+    ]);
+
+    // Parse stat categories from settings
+    const leagueSettings = settingsRes.data.fantasy_content.league;
+    const statSettings: any[] = leagueSettings[1]?.settings?.[0]?.stat_categories?.stats ?? [];
+    type StatCat = { stat_id: string; abbr: string; name: string; higherIsBetter: boolean };
+    const categories: StatCat[] = statSettings
+      .filter((s: any) => s.stat?.enabled === '1' || s.stat?.is_only_display_stat !== '1')
+      .map((s: any) => ({
+        stat_id: String(s.stat.stat_id),
+        abbr: s.stat.abbr ?? s.stat.display_name ?? String(s.stat.stat_id),
+        name: s.stat.display_name ?? s.stat.abbr ?? String(s.stat.stat_id),
+        higherIsBetter: s.stat.sort_order !== '-1' && s.stat.sort_order !== -1,
+      }));
+
+    // Parse all teams and their season stats
+    const teamsData = teamsRes.data.fantasy_content.league[1].teams;
+    type TeamStats = { teamKey: string; name: string; isMe: boolean; stats: Record<string, string> };
+    const teams: TeamStats[] = [];
+
+    for (const [k, v] of Object.entries(teamsData) as [string, any][]) {
+      if (k === 'count') continue;
+      const teamArr = v.team[0];
+      const statsArr = v.team[1]?.team_stats?.stats ?? [];
+      const teamKey = teamArr.find((x: any) => x.team_key !== undefined)?.team_key ?? '';
+      const name = teamArr.find((x: any) => x.name !== undefined)?.name ?? '?';
+      const statMap: Record<string, string> = {};
+      for (const s of statsArr) {
+        if (s.stat) statMap[String(s.stat.stat_id)] = s.stat.value ?? '';
+      }
+      teams.push({ teamKey, name, isMe: teamKey === myTeamKey, stats: statMap });
+    }
+
+    // Rank teams per category
+    const myRankings: Record<string, { rank: number; of: number; value: string; abbr: string }> = {};
+    const fullTable: any[] = [];
+    const strengths: string[] = [];
+    const weaknesses: string[] = [];
+    const n = teams.length;
+
+    for (const cat of categories) {
+      const inputs = teams.map((t) => {
+        const raw = t.stats[cat.stat_id];
+        const parsed = raw !== undefined && raw !== '-' && raw !== '' ? parseFloat(raw) : null;
+        return { teamKey: t.teamKey, value: parsed };
+      });
+
+      const ranked = computeCategoryRankings(inputs, cat.higherIsBetter);
+      const myEntry = ranked.find((r) => r.teamKey === myTeamKey);
+      if (!myEntry) continue;
+
+      const myRank = myEntry.rank;
+      const myValue = teams.find((t) => t.teamKey === myTeamKey)?.stats[cat.stat_id] ?? '—';
+      myRankings[cat.abbr] = { rank: myRank, of: n, value: myValue, abbr: cat.abbr };
+
+      if (myRank <= Math.ceil(n * 0.3)) strengths.push(cat.abbr);
+      if (myRank >= Math.floor(n * 0.7) + 1) weaknesses.push(cat.abbr);
+
+      const tableRows = ranked.map((r) => {
+        const team = teams.find((t) => t.teamKey === r.teamKey)!;
+        return { rank: r.rank, team: team.name, value: team.stats[cat.stat_id] ?? '—', is_my_team: team.isMe };
+      });
+      fullTable.push({ stat: cat.abbr, name: cat.name, higher_is_better: cat.higherIsBetter, rankings: tableRows });
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          as_of: new Date().toISOString().slice(0, 10),
+          teams_in_league: n,
+          my_rankings: myRankings,
+          strengths,
+          weaknesses,
+          full_table: fullTable,
+          note: 'Rankings based on season-to-date cumulative stats from Yahoo.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async getPitcherStarts(args: any) {
+    const days: number = args?.days ?? 7;
+    const startDate: string = args?.date ?? new Date().toISOString().slice(0, 10);
+
+    // Build end date
+    const start = new Date(startDate + 'T12:00:00Z');
+    const end = new Date(start);
+    end.setDate(end.getDate() + days - 1);
+    const endDate = end.toISOString().slice(0, 10);
+
+    // Fetch roster and MLB schedule in parallel
+    const teamKey = await this.buildTeamKey();
+    const [rosterRes, scheduleRes] = await Promise.all([
+      this.yahooApi.get(`/team/${teamKey}/roster/players`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+      this.mlbApi.get('/schedule', {
+        params: {
+          sportId: 1,
+          startDate,
+          endDate,
+          hydrate: 'probablePitcher',
+          fields: 'dates,date,games,teams,home,away,team,name,probablePitcher,fullName,status,detailedState',
+        },
+      }),
+    ]);
+
+    // Extract rostered pitchers
+    const rosterObj = rosterRes.data.fantasy_content.team[1].roster;
+    const playersMap = extractPlayersMap(rosterObj);
+    const rosteredPitchers = Object.entries(playersMap)
+      .filter(([k]) => k !== 'count')
+      .map(([, v]: [string, any]) => parsePlayerInfo(v.player[0]))
+      .filter((p) => ['SP', 'RP', 'P'].some((pos) => p.position?.includes(pos)));
+
+    const rosterNames = rosteredPitchers.map((p) => normalizeName(p.name));
+
+    // Build starts list from schedule
+    const starts: any[] = [];
+    for (const dateBlock of scheduleRes.data.dates ?? []) {
+      for (const game of dateBlock.games ?? []) {
+        if (game.status?.detailedState === 'Postponed') continue;
+        for (const side of ['home', 'away'] as const) {
+          const pitcher = game.teams[side]?.probablePitcher;
+          if (!pitcher?.fullName) continue;
+          const normPitcher = normalizeName(pitcher.fullName);
+          const match = rosterNames.findIndex(
+            (n) => normPitcher.includes(n) || n.includes(normPitcher)
+          );
+          if (match === -1) continue;
+          const opponent = game.teams[side === 'home' ? 'away' : 'home']?.team?.name ?? '?';
+          starts.push({
+            pitcher: rosteredPitchers[match]!.name,
+            date: dateBlock.date,
+            opponent,
+            home_away: side === 'home' ? 'HOME' : 'AWAY',
+            status: game.status?.detailedState ?? 'Scheduled',
+          });
+        }
+      }
+    }
+
+    starts.sort((a, b) => a.date.localeCompare(b.date));
+
+    // Count starts per pitcher
+    const startCounts: Record<string, number> = {};
+    for (const s of starts) {
+      startCounts[s.pitcher] = (startCounts[s.pitcher] ?? 0) + 1;
+    }
+
+    const noStarts = rosteredPitchers
+      .filter((p) => !startCounts[p.name])
+      .map((p) => p.name);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          range: `${startDate} → ${endDate}`,
+          total_starts: starts.length,
+          starts,
+          starts_per_pitcher: startCounts,
+          no_starts_scheduled: noStarts,
+          note: 'Probable starters from MLB Stats API. Early in the week, some slots may not be announced yet.',
         }, null, 2),
       }],
     };

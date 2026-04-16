@@ -78,3 +78,4 @@ Once restarted, try asking Claude:
 > "Use the `get_team_roster` tool to show my current lineup"
 
 If it returns your roster, you're live.
+5%

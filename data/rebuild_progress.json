@@ -1,0 +1,48 @@
+[
+  {
+    "date": "2026-04-16",
+    "timestamp": "2026-04-16T16:18:39.681Z",
+    "median_age": 29,
+    "rebuild_score": {
+      "age_24_and_under": 4,
+      "age_25_to_27": 9,
+      "age_28_to_29": 4,
+      "age_30_plus": 13,
+      "total": 30
+    },
+    "roster_snapshot": [
+      "Cal Raleigh (29)",
+      "Luis Arraez (29)",
+      "Gleyber Torres (29)",
+      "Matt Shaw (24)",
+      "Ezequiel Tovar (24)",
+      "Yandy Díaz (34)",
+      "Jose Altuve (35)",
+      "Alec Burleson (27)",
+      "Bryan Reynolds (31)",
+      "Jo Adell (27)",
+      "Ian Happ (31)",
+      "Luis Robert Jr. (28)",
+      "Shohei Ohtani (Batter) (31)",
+      "Yainer Diaz (27)",
+      "Geraldo Perdomo (26)",
+      "Jordan Walker (23)",
+      "Tanner Bibee (27)",
+      "Parker Messick (25)",
+      "Dylan Cease (30)",
+      "Seth Lugo (36)",
+      "Zac Gallen (30)",
+      "Dennis Santana (30)",
+      "Mike Burrows (26)",
+      "David Bednar (31)",
+      "Andrew Abbott (26)",
+      "Nathan Eovaldi (36)",
+      "Kyle Harrison (24)",
+      "Reynaldo López (32)",
+      "Michael McGreevy (25)",
+      "George Springer (36)",
+      "Jordan Westburg (?)",
+      "Quinn Priester (?)"
+    ]
+  }
+]

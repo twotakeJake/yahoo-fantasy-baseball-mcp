@@ -1,5 +1,5 @@
 # Flatbottom Phil — Backlog & Implementation Notes
-**Last updated:** 2026-03-25
+**Last updated:** 2026-04-13
 
 ---
 
@@ -61,9 +61,15 @@ Pick one notifier or support both via env flag (`NOTIFY_VIA=pushover|twilio`).
 
 | Priority | Item | Notes |
 |---|---|---|
+| ✅ Done | `get_pitcher_starts` | Which of your SP/RP are starting on a given day/week, and how many starts remain in the scoring period. Essential for streaming decisions. Pull from Yahoo schedule or MLB stats API. |
+| ✅ Done | `get_roster_injury_sweep` | Proactive sweep of all rostered players — returns anyone with a new injury flag since last check. Complements `get_player_news` which is pull-based per player. |
+| ✅ Done | `get_category_standings` | Break down standings category-by-category across the league — rank in each stat. Useful for deciding whether to stream for Ks vs ERA vs saves. |
+| ✅ Done | `set_lineup` | Push optimal lineup to Yahoo for a given day. Requires Yahoo roster edit API endpoint. Biggest lift but highest daily value. |
+| ✅ Done | `get_opponent_scouting` | Deep dive on current matchup opponent: roster health, recent trends, category vulnerabilities to exploit. Extends existing `get_matchup`. |
 | Medium | Caching layer | League rosters re-fetch every tool call. One shared fetch/session cuts Yahoo API calls ~60% |
 | Medium | `evaluate_advice` outcomes | Tool is built; needs actual use to accumulate data |
-| Low | Player blurbs (Rotowire) | JS-rendered, not accessible via WebFetch. Needs headless browser (Playwright) |
+| ✅ Done | `get_faab_budget` | Remaining FAAB budget + bid history for leagues using auction waivers. |
+| Low | Player blurbs (Rotowire) | JS-rendered. Needs headless Playwright (chromium). Run one persistent browser instance at server start, reuse across calls. `npm install playwright` + `npx playwright install chromium` (~300MB one-time). Keep MLB.com RSS (`get_player_news`) for fast general headlines; Rotowire adds fantasy-specific injury/performance blurbs. |
 | Low | Crown jewel pitch integration | Auto-pull trade_scenarios.md counter-offer when Ohtani/Raleigh is the target in pitch tool |
 | Low | Pitch persistence | Auto-append generated pitches to docs/trade_scenarios.md |
 | Idea | Morning digest + notifications | See above — SMS (Twilio) or push (Pushover) |
@@ -80,4 +86,6 @@ Pick one notifier or support both via env flag (`NOTIFY_VIA=pushover|twilio`).
 - `get_league_power_rankings`
 - `auto_generate_trade_pitch` (buying + selling modes, offer tiers, live ADP)
 - `find_free_agents`
+- `get_player_news` (MLB.com RSS feed, multi-player, searchable by last name)
+- injury status + injuryNote surfaced on all roster/wire calls via `parsePlayerInfo`
 - CI fix: typescript → devDependencies, removed @types/bun

@@ -2262,9 +2262,15 @@ class FlatbottomPhil {
       return { content: [{ type: 'text', text: `No matchup found for week ${currentWeek}.` }] };
     }
 
-    const matchupMeta = myMatchup[0];
-    const teamsObj = matchupMeta.teams;
-    const result: any = { week: currentWeek, status: matchupMeta.status ?? '?', teams: [] };
+    // Yahoo nests the teams under matchup[0], but status/winner_team_key/is_tied
+    // live on the matchup object itself (one level up). Reading them off
+    // matchup[0] always yields undefined — that's why status used to show "?".
+    const teamsObj = myMatchup[0].teams;
+    const status = mapMatchupStatus(myMatchup.status, currentWeek, currentWeek);
+    const isTied = String(myMatchup.is_tied ?? '0') === '1';
+    const winnerKey: string | null = myMatchup.winner_team_key ?? null;
+    const keyToName: Record<string, string> = {};
+    const result: any = { week: currentWeek, status, teams: [] };
 
     for (const [tk, tv] of Object.entries(teamsObj) as [string, any][]) {
       if (tk === 'count') continue;
@@ -2275,6 +2281,7 @@ class FlatbottomPhil {
       const name = teamArr.find((x: any) => x.name !== undefined)?.name ?? '?';
       const teamKey = teamArr.find((x: any) => x.team_key !== undefined)?.team_key ?? '?';
       const isMe = teamKey === myTeamKey;
+      keyToName[teamKey] = name;
 
       const stats: any[] = [];
       for (const s of statsArr) {
@@ -2303,6 +2310,12 @@ class FlatbottomPhil {
           name: statCats[String(s.stat_id)] ?? String(s.stat_id),
         }));
       }
+    }
+
+    // For finished weeks, surface who won (resolved to a team name) and ties.
+    if (status === 'completed') {
+      result.is_tied = isTied;
+      result.winner = isTied ? 'Tie' : (winnerKey ? (keyToName[winnerKey] ?? winnerKey) : null);
     }
 
     return {

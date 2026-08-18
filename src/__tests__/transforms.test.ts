@@ -8,6 +8,10 @@ import {
   extractPlayersMap,
   computeCategoryRankings,
   buildOptimalLineup,
+  rankBand,
+  competitiveTier,
+  mapMatchupStatus,
+  defaultScheduleWeeks,
 } from '../utils/transforms.js';
 
 // ---------------------------------------------------------------------------
@@ -345,5 +349,68 @@ describe('computeCategoryRankings', () => {
   it('preserves value in output', () => {
     const result = computeCategoryRankings([{ teamKey: 'A', value: 3.14 }], false);
     assert.equal(result[0]!.value, 3.14);
+  });
+});
+
+describe('rankBand', () => {
+  it('classifies ranks 1-4 as top', () => {
+    assert.equal(rankBand(1), 'top');
+    assert.equal(rankBand(4), 'top');
+  });
+  it('classifies ranks 5-7 as mid', () => {
+    assert.equal(rankBand(5), 'mid');
+    assert.equal(rankBand(7), 'mid');
+  });
+  it('classifies ranks 8-10 as bottom', () => {
+    assert.equal(rankBand(8), 'bottom');
+    assert.equal(rankBand(10), 'bottom');
+  });
+});
+
+describe('competitiveTier', () => {
+  it('labels two top teams top_vs_top', () => {
+    assert.equal(competitiveTier(1, 4), 'top_vs_top');
+  });
+  it('labels top vs bottom regardless of argument order', () => {
+    assert.equal(competitiveTier(2, 9), 'top_vs_bottom');
+    assert.equal(competitiveTier(9, 2), 'top_vs_bottom');
+  });
+  it('labels top vs mid', () => {
+    assert.equal(competitiveTier(3, 6), 'top_vs_mid');
+  });
+  it('labels mid vs mid, mid vs bottom, bottom vs bottom', () => {
+    assert.equal(competitiveTier(5, 7), 'mid_vs_mid');
+    assert.equal(competitiveTier(6, 10), 'mid_vs_bottom');
+    assert.equal(competitiveTier(8, 10), 'bottom_vs_bottom');
+  });
+  it('returns unknown when a rank is missing or invalid', () => {
+    assert.equal(competitiveTier(null, 3), 'unknown');
+    assert.equal(competitiveTier(3, undefined), 'unknown');
+    assert.equal(competitiveTier(NaN, 3), 'unknown');
+  });
+});
+
+describe('mapMatchupStatus', () => {
+  it('maps Yahoo status strings', () => {
+    assert.equal(mapMatchupStatus('postevent', 20, 21), 'completed');
+    assert.equal(mapMatchupStatus('midevent', 21, 21), 'in_progress');
+    assert.equal(mapMatchupStatus('preevent', 22, 21), 'upcoming');
+  });
+  it('falls back to week comparison when status is missing/unknown', () => {
+    assert.equal(mapMatchupStatus(undefined, 20, 21), 'completed');
+    assert.equal(mapMatchupStatus(null, 21, 21), 'in_progress');
+    assert.equal(mapMatchupStatus('', 22, 21), 'upcoming');
+  });
+});
+
+describe('defaultScheduleWeeks', () => {
+  it('returns remaining regular-season weeks by default', () => {
+    assert.deepEqual(defaultScheduleWeeks(21, 1, 23, false), [21, 22, 23]);
+  });
+  it('includes past weeks when includeCompleted is set', () => {
+    assert.deepEqual(defaultScheduleWeeks(3, 1, 4, true), [1, 2, 3, 4]);
+  });
+  it('falls back to a single clamped week when the regular season is over', () => {
+    assert.deepEqual(defaultScheduleWeeks(24, 1, 23, false), [23]);
   });
 });

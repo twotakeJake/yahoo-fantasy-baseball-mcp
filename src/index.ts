@@ -12,7 +12,7 @@ import { config } from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { normalizeName, lookupAge, extractField, parsePlayerInfo, extractPlayersMap, computeCategoryRankings, buildOptimalLineup } from './utils/transforms.js';
+import { normalizeName, lookupAge, extractField, parsePlayerInfo, extractPlayersMap, computeCategoryRankings, buildOptimalLineup, competitiveTier, mapMatchupStatus, defaultScheduleWeeks } from './utils/transforms.js';
 
 config();
 
@@ -455,6 +455,31 @@ class FlatbottomPhil {
           },
         },
         {
+          name: 'get_schedule',
+          description:
+            'Full league schedule for one or more weeks — all matchups, every team, not just yours. ' +
+            'Each matchup includes both teams\' season win pct and a competitive_tier label ' +
+            '(top_vs_top, top_vs_bottom, etc.) computed from current standings, so you can see whether ' +
+            'the contenders play each other in the closing weeks ("chaos week") or feast on bottom-feeders. ' +
+            'Completed weeks include the result (category-win totals and winner). ' +
+            'Defaults to the remaining regular-season weeks.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              weeks: {
+                type: 'array',
+                items: { type: 'number' },
+                description: 'Specific weeks to return, e.g. [21, 22, 23]. Defaults to all remaining regular-season weeks.',
+              },
+              include_completed: {
+                type: 'boolean',
+                description: 'When defaulting the week range, also include past (completed) weeks. Default false. Ignored when `weeks` is given explicitly.',
+              },
+            },
+            additionalProperties: false,
+          },
+        },
+        {
           name: 'evaluate_advice',
           description:
             'Phil\'s accountability log. ' +
@@ -681,6 +706,8 @@ class FlatbottomPhil {
             return await this.getLeagueTransactions(request.params.arguments);
           case 'get_matchup':
             return await this.getMatchup(request.params.arguments);
+          case 'get_schedule':
+            return await this.getSchedule(request.params.arguments);
           case 'find_free_agents':
             return await this.findFreeAgents(request.params.arguments);
           case 'evaluate_advice':
@@ -2280,6 +2307,149 @@ class FlatbottomPhil {
 
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    };
+  }
+
+  private async getSchedule(args: any) {
+    const leagueKey = await this.buildLeagueKey();
+
+    // --- League timing: current / start / end weeks + playoff boundary ---
+    const settingsRes = await this.yahooApi.get(`/league/${leagueKey}/settings`, {
+      headers: this.authHeaders(),
+      params: { format: 'json' },
+    });
+    const leagueSettings = settingsRes.data.fantasy_content.league;
+    const metaArr = Array.isArray(leagueSettings[0]) ? leagueSettings[0] : Object.values(leagueSettings[0]);
+    const num = (v: any): number | undefined => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const currentWeek = num(extractField(metaArr, 'current_week') ?? leagueSettings[0]?.current_week) ?? 1;
+    const startWeek = num(extractField(metaArr, 'start_week') ?? leagueSettings[0]?.start_week) ?? 1;
+    const endWeek = num(extractField(metaArr, 'end_week') ?? leagueSettings[0]?.end_week) ?? currentWeek;
+    const settingsObj = leagueSettings[1]?.settings?.[0] ?? {};
+    const playoffStartWeek = num(settingsObj.playoff_start_week) ?? endWeek + 1;
+    const regularSeasonEndWeek = playoffStartWeek - 1;
+
+    // --- Which weeks to return ---
+    let weeks: number[];
+    if (Array.isArray(args?.weeks) && args.weeks.length > 0) {
+      const requested = (args.weeks as any[]).map((w) => Number(w)).filter((w) => Number.isFinite(w));
+      weeks = [...new Set<number>(requested)].sort((a, b) => a - b);
+    } else {
+      weeks = defaultScheduleWeeks(currentWeek, startWeek, regularSeasonEndWeek, !!args?.include_completed);
+    }
+
+    // --- Standings map: team_key -> { name, rank, winPct } (for tiers/win pct) ---
+    const standingsRes = await this.yahooApi.get(`/league/${leagueKey}/standings`, {
+      headers: this.authHeaders(),
+      params: { format: 'json' },
+    });
+    const standingsTeams = standingsRes.data.fantasy_content.league[1].standings[0].teams;
+    const standByKey = new Map<string, { name: string; rank: number | null; winPct: string | null }>();
+    for (const [k, v] of Object.entries(standingsTeams) as [string, any][]) {
+      if (k === 'count') continue;
+      const info = v.team[0];
+      const teamKey = info.find((x: any) => x.team_key !== undefined)?.team_key;
+      const name = info.find((x: any) => x.name !== undefined)?.name ?? '?';
+      const ts = v.team[2]?.team_standings;
+      const rank = ts?.rank != null ? Number(ts.rank) : null;
+      const winPct = ts?.outcome_totals?.percentage ?? null;
+      if (teamKey) standByKey.set(teamKey, { name, rank, winPct });
+    }
+
+    // --- Walk each requested week's scoreboard ---
+    const weeksOut: any[] = [];
+    for (const wk of weeks) {
+      const sbRes = await this.yahooApi.get(`/league/${leagueKey}/scoreboard;week=${wk}`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      });
+      const matchupsObj = sbRes.data.fantasy_content.league[1].scoreboard[0].matchups ?? {};
+      const matchupsOut: any[] = [];
+      let weekStatus: 'completed' | 'in_progress' | 'upcoming' | null = null;
+
+      for (const [k, v] of Object.entries(matchupsObj) as [string, any][]) {
+        if (k === 'count') continue;
+        const m = v.matchup;
+        // Yahoo nests the teams under matchup["0"], while status/winner/is_tied
+        // sit on the matchup object itself (one level up).
+        const teamsObj = m?.[0]?.teams ?? {};
+        const yahooStatus: string | undefined = m?.status;
+        const isTied = String(m?.is_tied ?? '0') === '1';
+        const winnerKey: string | null = m?.winner_team_key ?? null;
+
+        const parsed: { teamKey: string | null; name: string; points: number | null; rank: number | null; winPct: string | null }[] = [];
+        for (const [tk, tv] of Object.entries(teamsObj) as [string, any][]) {
+          if (tk === 'count') continue;
+          const teamArr = tv.team[0];
+          const teamKey = teamArr.find((x: any) => x.team_key !== undefined)?.team_key ?? null;
+          const name = teamArr.find((x: any) => x.name !== undefined)?.name ?? '?';
+          const pointsRaw = tv.team[1]?.team_points?.total;
+          const stand = teamKey ? standByKey.get(teamKey) : undefined;
+          parsed.push({
+            teamKey,
+            name,
+            points: pointsRaw != null && pointsRaw !== '' ? Number(pointsRaw) : null,
+            rank: stand?.rank ?? null,
+            winPct: stand?.winPct ?? null,
+          });
+        }
+
+        const home = parsed[0];
+        const away = parsed[1];
+        if (!home || !away) continue;
+
+        const status = mapMatchupStatus(yahooStatus, wk, currentWeek);
+        if (weekStatus === null) weekStatus = status;
+
+        const matchup: any = {
+          home_team: home.name,
+          away_team: away.name,
+          home_win_pct: home.winPct ?? '—',
+          away_win_pct: away.winPct ?? '—',
+          competitive_tier: competitiveTier(home.rank, away.rank),
+        };
+
+        if (status === 'completed') {
+          let winner: string;
+          if (isTied) {
+            winner = 'Tie';
+          } else if (winnerKey) {
+            winner = standByKey.get(winnerKey)?.name
+              ?? (winnerKey === home.teamKey ? home.name : winnerKey === away.teamKey ? away.name : winnerKey);
+          } else if (home.points != null && away.points != null) {
+            winner = home.points > away.points ? home.name : away.points > home.points ? away.name : 'Tie';
+          } else {
+            winner = '?';
+          }
+          matchup.result = {
+            home_points: home.points ?? 0,
+            away_points: away.points ?? 0,
+            winner,
+          };
+        }
+
+        matchupsOut.push(matchup);
+      }
+
+      weeksOut.push({
+        week: wk,
+        status: weekStatus ?? mapMatchupStatus(null, wk, currentWeek),
+        matchups: matchupsOut,
+      });
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          current_week: currentWeek,
+          playoff_start_week: playoffStartWeek,
+          regular_season_end_week: regularSeasonEndWeek,
+          weeks: weeksOut,
+        }, null, 2),
+      }],
     };
   }
 

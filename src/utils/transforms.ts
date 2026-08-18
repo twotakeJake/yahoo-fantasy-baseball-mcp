@@ -157,3 +157,97 @@ export function computeCategoryRankings(
 
   return [...ranked, ...nullRanked];
 }
+
+/**
+ * Standings tier for a given rank, calibrated for a 10-team league:
+ * ranks 1-4 = "top", 5-7 = "mid", 8-10 = "bottom".
+ */
+export function rankBand(rank: number): 'top' | 'mid' | 'bottom' {
+  if (rank <= 4) return 'top';
+  if (rank <= 7) return 'mid';
+  return 'bottom';
+}
+
+/**
+ * Classify a matchup by both teams' standings ranks into one of six
+ * order-independent competitive tiers (e.g. top_vs_top, top_vs_bottom).
+ * A week of top_vs_top matchups compresses the standings ("chaos week");
+ * a week of top_vs_bottom matchups lets the strong teams pad their records.
+ * Returns 'unknown' if either rank is missing/invalid.
+ */
+export function competitiveTier(
+  rankA: number | null | undefined,
+  rankB: number | null | undefined
+):
+  | 'top_vs_top'
+  | 'top_vs_mid'
+  | 'top_vs_bottom'
+  | 'mid_vs_mid'
+  | 'mid_vs_bottom'
+  | 'bottom_vs_bottom'
+  | 'unknown' {
+  if (
+    rankA == null || rankB == null ||
+    !Number.isFinite(rankA) || !Number.isFinite(rankB)
+  ) {
+    return 'unknown';
+  }
+  // Order the two bands so the label is deterministic regardless of home/away.
+  const order = { top: 0, mid: 1, bottom: 2 } as const;
+  const bands = [rankBand(rankA), rankBand(rankB)].sort(
+    (x, y) => order[x] - order[y]
+  );
+  return `${bands[0]}_vs_${bands[1]}` as
+    | 'top_vs_top'
+    | 'top_vs_mid'
+    | 'top_vs_bottom'
+    | 'mid_vs_mid'
+    | 'mid_vs_bottom'
+    | 'bottom_vs_bottom';
+}
+
+/**
+ * Map Yahoo's scoreboard matchup status (preevent/midevent/postevent) to the
+ * schedule vocabulary. Falls back to comparing the week against the current
+ * week when Yahoo's status string is missing or unrecognized.
+ */
+export function mapMatchupStatus(
+  yahooStatus: string | null | undefined,
+  week: number,
+  currentWeek: number
+): 'completed' | 'in_progress' | 'upcoming' {
+  switch (yahooStatus) {
+    case 'postevent':
+      return 'completed';
+    case 'midevent':
+      return 'in_progress';
+    case 'preevent':
+      return 'upcoming';
+  }
+  if (week < currentWeek) return 'completed';
+  if (week === currentWeek) return 'in_progress';
+  return 'upcoming';
+}
+
+/**
+ * Build the default list of weeks for get_schedule when none are supplied:
+ * remaining regular-season weeks (currentWeek..regularSeasonEndWeek), or the
+ * full regular season when includeCompleted is set. Always sorted ascending
+ * and clamped to at least one week.
+ */
+export function defaultScheduleWeeks(
+  currentWeek: number,
+  startWeek: number,
+  regularSeasonEndWeek: number,
+  includeCompleted: boolean
+): number[] {
+  const from = includeCompleted ? startWeek : currentWeek;
+  const weeks: number[] = [];
+  for (let w = from; w <= regularSeasonEndWeek; w++) weeks.push(w);
+  // If the regular season is already over (or we're past it), fall back to the
+  // current week clamped into the valid range so the tool still returns data.
+  if (weeks.length === 0) {
+    weeks.push(Math.min(Math.max(currentWeek, startWeek), regularSeasonEndWeek));
+  }
+  return weeks;
+}

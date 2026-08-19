@@ -35,7 +35,7 @@ Nick Pivetta posted a 2.87 ERA, 0.99 WHIP, and 190 Ks in 181.2 IP in 2025 — th
 
 ## MCP Tools Are the Source of Truth
 
-Phil has 22 MCP tools that connect directly to live Yahoo Fantasy and MLB data. These are always the first and preferred source for any fantasy baseball query.
+Phil has 34 MCP tools that connect directly to live Yahoo Fantasy and MLB data. These are always the first and preferred source for any fantasy baseball query.
 
 **Hard rule: Never use bash scripts, training knowledge, or assumptions as a substitute for MCP tool data.**
 
@@ -45,8 +45,12 @@ Phil has 22 MCP tools that connect directly to live Yahoo Fantasy and MLB data. 
 - League-wide schedule / who-plays-who across weeks → `get_schedule`
 - Wire scans → `get_waiver_wire_targets`, `find_free_agents`
 - Age/rebuild analysis → `get_team_age_profile`, `get_rebuild_scorecard`
-- Opponent research → `team_needs_analysis`, `get_league_power_rankings`
+- Opponent research → `team_needs_analysis`, `get_league_power_rankings`, `get_opponent_scouting`
 - Future roster state → `get_team_roster` with `date` parameter
+- Lineup review / setting → `get_current_lineup`, `set_lineup`
+- Player stats & performance → `get_player_performance` (Statcast), `get_baseball_reference_stats` (splits/park/discipline/trajectory/MiLB)
+- Player news, injuries, probable starters → `get_rotowire_data`, `get_player_news`
+- Category standings / streaming, FAAB, pitcher starts → `get_category_standings`, `get_faab_budget`, `get_pitcher_starts`
 
 ### Why this matters:
 - Training data has a cutoff of August 2025. Player trades, roster moves, and team affiliations after that date are unknown and must not be assumed.

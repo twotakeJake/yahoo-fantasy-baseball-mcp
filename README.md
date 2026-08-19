@@ -9,7 +9,7 @@ Age data is pulled live from the **MLB Stats API** and cross-referenced by name 
 
 ---
 
-## Available Tools (22)
+## Available Tools (34)
 
 ### Roster & Wire
 
@@ -20,6 +20,8 @@ Age data is pulled live from the **MLB Stats API** and cross-referenced by name 
 | `find_free_agents` | Roster-aware wire finder. Detects your positional thin spots and surfaces available players that fill those gaps, sorted by ADP. Filter to a specific position or scan all thin spots at once |
 | `get_waiver_wire_delta` | What changed on the wire since the last scan — newly available and newly claimed players |
 | `get_prospect_overlap` | Cross-references your roster and wire against recently debuted young players (age ≤25, debuted 2024+) |
+| `get_pitcher_starts` | Which of your rostered pitchers are scheduled to start over the next N days (default 7), with opponent, home/away, and date — for streaming and counting starts left in the scoring week |
+| `get_roster_injury_sweep` | Sweeps your roster for injuries — currently injured, newly flagged, and recently cleared; saves a snapshot each run so the delta stays fresh |
 
 ### Rebuild & Age Analysis
 
@@ -50,6 +52,25 @@ Age data is pulled live from the **MLB Stats API** and cross-referenced by name 
 | `get_league_transactions` | Recent league-wide adds, drops, and trades. Filterable by type |
 | `get_matchup` | Current week H2H matchup — your roster vs opponent's, with category stat breakdown |
 | `get_schedule` | Full league schedule for one or more weeks — all matchups with competitive_tier labels (top_vs_top, etc.) and results for completed weeks. Defaults to remaining regular-season weeks |
+| `get_category_standings` | Ranks all teams category-by-category on season-to-date stats — your rank per category, strengths/weaknesses, and the full per-stat table. Essential for streaming decisions |
+| `get_opponent_scouting` | Deep dive on this week's opponent — full roster with injury flags, season category ranks vs the league, and which categories to attack (they're weak) vs defend (they're strong) |
+| `get_faab_budget` | Your remaining FAAB budget vs the rest of the league (or waiver priority if the league is priority-based) |
+
+### Lineup
+
+| Tool | Description |
+|---|---|
+| `get_current_lineup` | Your active/BN/IL assignments for a given date, flags issues (injured players in active slots, IL-eligible players on BN, empty slots), and compares against the optimal lineup |
+| `set_lineup` | Optimize and push your lineup to Yahoo for a date — auto-assigns IL-eligible injured players to IL, fills active slots most-constrained-first, benches the rest. `dry_run=true` to preview |
+
+### Player Research & Data
+
+| Tool | Description |
+|---|---|
+| `get_player_performance` | Statcast-powered profile for one or more players — fantasy stats plus advanced metrics (xERA, Barrel%, wOBA, Hard Hit%, fWAR, SwStr%) and opinionated signals: BABIP luck, ERA–xERA delta, contact-quality tier, and ADP over/underperformance |
+| `get_player_news` | Recent MLB.com RSS headlines for one or more players (editorial headlines, not fantasy blurbs) |
+| `get_rotowire_data` | RotoWire scraper — five data types: `player_news`, `probable_starters`, `pitcher_usage`, `player_outlook`, `injury_report`. 30-minute cache (`force_refresh` to bust) |
+| `get_baseball_reference_stats` | Baseball-Reference scraper — five stat types: `splits`, `park_factors`, `plate_discipline`, `career_trajectory`, `minor_league`. 24-hour cache |
 
 ### Logs & Accountability
 

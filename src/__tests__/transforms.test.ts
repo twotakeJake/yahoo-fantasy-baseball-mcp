@@ -8,6 +8,9 @@ import {
   extractPlayersMap,
   computeCategoryRankings,
   buildOptimalLineup,
+  adpTier,
+  generateBatterSignals,
+  generatePitcherSignals,
   rankBand,
   competitiveTier,
   mapMatchupStatus,
@@ -349,6 +352,226 @@ describe('computeCategoryRankings', () => {
   it('preserves value in output', () => {
     const result = computeCategoryRankings([{ teamKey: 'A', value: 3.14 }], false);
     assert.equal(result[0]!.value, 3.14);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// adpTier
+// ---------------------------------------------------------------------------
+
+describe('adpTier', () => {
+  it('returns Top 30 pick for pick <= 30', () => {
+    assert.equal(adpTier(1),  'Top 30 pick');
+    assert.equal(adpTier(30), 'Top 30 pick');
+  });
+
+  it('returns Rounds 2–4 for picks 31–75', () => {
+    assert.equal(adpTier(31), 'Rounds 2–4');
+    assert.equal(adpTier(75), 'Rounds 2–4');
+  });
+
+  it('returns Rounds 5–9 for picks 76–150', () => {
+    assert.equal(adpTier(76),  'Rounds 5–9');
+    assert.equal(adpTier(150), 'Rounds 5–9');
+  });
+
+  it('returns Rounds 10–15 for picks 151–250', () => {
+    assert.equal(adpTier(151), 'Rounds 10–15');
+    assert.equal(adpTier(250), 'Rounds 10–15');
+  });
+
+  it('returns Late/undrafted for picks > 250', () => {
+    assert.equal(adpTier(251), 'Late/undrafted');
+    assert.equal(adpTier(999), 'Late/undrafted');
+  });
+
+  it('returns Undrafted for null', () => {
+    assert.equal(adpTier(null), 'Undrafted');
+  });
+
+  it('returns Undrafted for undefined', () => {
+    assert.equal(adpTier(undefined), 'Undrafted');
+  });
+
+  it('returns Undrafted for NaN', () => {
+    assert.equal(adpTier(NaN), 'Undrafted');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// generateBatterSignals
+// ---------------------------------------------------------------------------
+
+describe('generateBatterSignals', () => {
+  it('returns empty array when all inputs are missing', () => {
+    assert.deepEqual(generateBatterSignals({}), []);
+  });
+
+  it('flags low BABIP as BABIP victim', () => {
+    const signals = generateBatterSignals({ babip: 0.240 });
+    assert.ok(signals.some((s) => s.includes('BABIP victim')));
+  });
+
+  it('flags elevated BABIP regression risk', () => {
+    const signals = generateBatterSignals({ babip: 0.360 });
+    assert.ok(signals.some((s) => s.includes('Elevated BABIP')));
+  });
+
+  it('reports normal BABIP range', () => {
+    const signals = generateBatterSignals({ babip: 0.300 });
+    assert.ok(signals.some((s) => s.includes('normal range')));
+  });
+
+  it('flags elite Barrel%', () => {
+    const signals = generateBatterSignals({ barrelPct: 18 });
+    assert.ok(signals.some((s) => s.includes('Elite Barrel%')));
+  });
+
+  it('flags above-average Barrel%', () => {
+    const signals = generateBatterSignals({ barrelPct: 12 });
+    assert.ok(signals.some((s) => s.includes('Above-average Barrel%')));
+  });
+
+  it('flags low Barrel%', () => {
+    const signals = generateBatterSignals({ barrelPct: 3 });
+    assert.ok(signals.some((s) => s.includes('Low Barrel%')));
+  });
+
+  it('flags elite Hard Hit%', () => {
+    const signals = generateBatterSignals({ hardHit: 48 });
+    assert.ok(signals.some((s) => s.includes('Elite Hard Hit%')));
+  });
+
+  it('flags soft contact concern', () => {
+    const signals = generateBatterSignals({ hardHit: 25 });
+    assert.ok(signals.some((s) => s.includes('Soft contact concern')));
+  });
+
+  it('flags elite wOBA', () => {
+    const signals = generateBatterSignals({ woba: 0.400 });
+    assert.ok(signals.some((s) => s.includes('Elite wOBA')));
+  });
+
+  it('flags below-average wOBA', () => {
+    const signals = generateBatterSignals({ woba: 0.270 });
+    assert.ok(signals.some((s) => s.includes('Below-average wOBA')));
+  });
+
+  it('flags ADP outperformance when pacing >> expected', () => {
+    // Top-30 pick (expected ~4 WAR), pacing way above
+    const signals = generateBatterSignals({ fwar: 3.0, gamesPlayed: 50, avgPick: 20 });
+    assert.ok(signals.some((s) => s.includes('Outperforming ADP')));
+  });
+
+  it('flags ADP underperformance when pacing << expected', () => {
+    // Top-30 pick (expected ~4 WAR), pacing way below
+    const signals = generateBatterSignals({ fwar: 0.1, gamesPlayed: 50, avgPick: 20 });
+    assert.ok(signals.some((s) => s.includes('Underperforming ADP')));
+  });
+
+  it('skips ADP signal when gamesPlayed < 10', () => {
+    const signals = generateBatterSignals({ fwar: 2.0, gamesPlayed: 5, avgPick: 20 });
+    assert.ok(!signals.some((s) => s.includes('ADP')));
+  });
+
+  it('skips ADP signal when avgPick is null', () => {
+    const signals = generateBatterSignals({ fwar: 2.0, gamesPlayed: 50, avgPick: null });
+    assert.ok(!signals.some((s) => s.includes('ADP')));
+  });
+
+  it('emits multiple signals when multiple inputs provided', () => {
+    const signals = generateBatterSignals({
+      babip: 0.240, barrelPct: 18, hardHit: 48, woba: 0.400,
+      fwar: 3.0, gamesPlayed: 50, avgPick: 20,
+    });
+    assert.ok(signals.length >= 4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// generatePitcherSignals
+// ---------------------------------------------------------------------------
+
+describe('generatePitcherSignals', () => {
+  it('returns empty array when all inputs are missing', () => {
+    assert.deepEqual(generatePitcherSignals({}), []);
+  });
+
+  it('flags ERA above xERA (pitcher unlucky, ERA should drop)', () => {
+    // era > xera → pitcher is pitching better than ERA shows
+    const signals = generatePitcherSignals({ era: 5.00, xera: 3.50 });
+    assert.ok(signals.some((s) => s.includes('ERA luck') && s.includes('ERA likely to drop')));
+  });
+
+  it('flags ERA below xERA (ERA inflation risk)', () => {
+    // era < xera → ERA is unsustainably low
+    const signals = generatePitcherSignals({ era: 2.50, xera: 3.50 });
+    assert.ok(signals.some((s) => s.includes('ERA luck') && s.includes('inflation risk')));
+  });
+
+  it('reports ERA aligned with xERA when delta is small', () => {
+    const signals = generatePitcherSignals({ era: 3.50, xera: 3.60 });
+    assert.ok(signals.some((s) => s.includes('aligned')));
+  });
+
+  it('flags elite K%', () => {
+    const signals = generatePitcherSignals({ kPct: 32 });
+    assert.ok(signals.some((s) => s.includes('Elite K%')));
+  });
+
+  it('flags below-average K%', () => {
+    const signals = generatePitcherSignals({ kPct: 17 });
+    assert.ok(signals.some((s) => s.includes('Below-average K%')));
+  });
+
+  it('flags control concern', () => {
+    const signals = generatePitcherSignals({ bbPct: 11 });
+    assert.ok(signals.some((s) => s.includes('Control concern')));
+  });
+
+  it('flags good control', () => {
+    const signals = generatePitcherSignals({ bbPct: 5 });
+    assert.ok(signals.some((s) => s.includes('Good control')));
+  });
+
+  it('flags elite SwStr%', () => {
+    const signals = generatePitcherSignals({ swStr: 15 });
+    assert.ok(signals.some((s) => s.includes('Elite SwStr%')));
+  });
+
+  it('flags high BABIP against', () => {
+    const signals = generatePitcherSignals({ babipAgainst: 0.350 });
+    assert.ok(signals.some((s) => s.includes('High BABIP against')));
+  });
+
+  it('flags low BABIP against (regression risk)', () => {
+    const signals = generatePitcherSignals({ babipAgainst: 0.230 });
+    assert.ok(signals.some((s) => s.includes('Low BABIP against')));
+  });
+
+  it('flags fWAR underperformance for high-ADP pitcher', () => {
+    // Top-75 pick with only 0.2 fWAR in 40 IP
+    const signals = generatePitcherSignals({ fwar: 0.2, ip: 40, avgPick: 50 });
+    assert.ok(signals.some((s) => s.includes('Underperforming ADP')));
+  });
+
+  it('flags fWAR outperformance for low-ADP pitcher', () => {
+    // Late pick (>150) with 0.8 fWAR in 30 IP
+    const signals = generatePitcherSignals({ fwar: 0.8, ip: 30, avgPick: 200 });
+    assert.ok(signals.some((s) => s.includes('Outperforming ADP')));
+  });
+
+  it('skips fWAR signal when ip <= 10', () => {
+    const signals = generatePitcherSignals({ fwar: 0.1, ip: 8, avgPick: 50 });
+    assert.ok(!signals.some((s) => s.includes('Underperforming ADP')));
+  });
+
+  it('emits multiple signals for a complete stat line', () => {
+    const signals = generatePitcherSignals({
+      era: 2.50, xera: 3.50, kPct: 32, bbPct: 5, swStr: 15,
+      babipAgainst: 0.240, fwar: 0.8, ip: 30, avgPick: 200,
+    });
+    assert.ok(signals.length >= 5);
   });
 });
 

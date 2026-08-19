@@ -8,25 +8,53 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
+import * as cheerio from 'cheerio';
 import { config } from 'dotenv';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { normalizeName, lookupAge, extractField, parsePlayerInfo, extractPlayersMap, computeCategoryRankings, buildOptimalLineup, competitiveTier, mapMatchupStatus, defaultScheduleWeeks } from './utils/transforms.js';
+import { normalizeName, lookupAge, extractField, parsePlayerInfo, extractPlayersMap, computeCategoryRankings, buildOptimalLineup, adpTier as adpTierLabel, generateBatterSignals, generatePitcherSignals, competitiveTier, mapMatchupStatus, defaultScheduleWeeks } from './utils/transforms.js';
 
 config();
 
-const YAHOO_CLIENT_ID = process.env.YAHOO_CLIENT_ID || '';
-const YAHOO_CLIENT_SECRET = process.env.YAHOO_CLIENT_SECRET || '';
-let accessToken = process.env.YAHOO_ACCESS_TOKEN || '';
-let refreshToken = process.env.YAHOO_REFRESH_TOKEN || '';
+let yahooCookies = process.env.YAHOO_COOKIES || '';
+let yahooCrumb = process.env.YAHOO_CRUMB || '';
 
 const LEAGUE_ID = process.env.YAHOO_LEAGUE_ID || '';
 const TEAM_NUMBER = process.env.YAHOO_TEAM_NUMBER || '';
 const TEAM_NAME = process.env.YAHOO_TEAM_NAME || 'My Team';
 
-if (!YAHOO_CLIENT_ID || !YAHOO_CLIENT_SECRET || !LEAGUE_ID || !TEAM_NUMBER) {
-  throw new Error('YAHOO_CLIENT_ID, YAHOO_CLIENT_SECRET, YAHOO_LEAGUE_ID, and YAHOO_TEAM_NUMBER are required in environment variables');
+if (!yahooCookies || !LEAGUE_ID || !TEAM_NUMBER) {
+  throw new Error('YAHOO_COOKIES, YAHOO_LEAGUE_ID, and YAHOO_TEAM_NUMBER are required in environment variables');
+}
+
+const CLAUDE_CONFIG_PATH = path.join(
+  os.homedir(),
+  'Library',
+  'Application Support',
+  'Claude',
+  'claude_desktop_config.json'
+);
+
+function persistCookiesAndCrumb(cookies: string, crumb: string): void {
+  try {
+    const raw = fs.readFileSync(CLAUDE_CONFIG_PATH, 'utf8');
+    const cfg = JSON.parse(raw);
+    const serverEnv = cfg?.mcpServers?.['yahoo-fantasy-baseball']?.env;
+    if (!serverEnv) {
+      console.error('[Auth] yahoo-fantasy-baseball env block not found in config.');
+      return;
+    }
+    serverEnv.YAHOO_COOKIES = cookies;
+    serverEnv.YAHOO_CRUMB = crumb;
+    const tmpPath = CLAUDE_CONFIG_PATH + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2));
+    fs.renameSync(tmpPath, CLAUDE_CONFIG_PATH);
+    console.error('[Auth] Crumb written to Claude Desktop config.');
+  } catch (err) {
+    console.error('[Auth] Failed to persist to config:', (err as Error).message);
+  }
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -38,6 +66,11 @@ class FlatbottomPhil {
   private mlbApi;
   private cachedGameKey: string | null = null;
   private cachedAgeMap: Map<string, { age: number; jersey: string }[]> | null = null;
+  private brCache: Map<string, { data: any; fetchedAt: number }> = new Map();
+  private readonly BR_CACHE_TTL = 24 * 60 * 60 * 1000;
+  private rwCache: Map<string, { data: any; fetchedAt: number }> = new Map();
+  private readonly RW_CACHE_TTL = 30 * 60 * 1000;        // 30 min — RW updates frequently
+  private readonly RW_PID_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hr for player ID lookups
 
   constructor() {
     this.server = new Server(
@@ -46,11 +79,17 @@ class FlatbottomPhil {
     );
 
     this.yahooApi = axios.create({
-      baseURL: 'https://fantasysports.yahooapis.com/fantasy/v2',
+      baseURL: 'https://pub-api-rw.fantasysports.yahoo.com/fantasy/v2',
     });
 
     this.mlbApi = axios.create({
       baseURL: 'https://statsapi.mlb.com/api/v1',
+    });
+
+    // Inject crumb into every Yahoo API request automatically
+    this.yahooApi.interceptors.request.use((cfg) => {
+      cfg.params = { crumb: yahooCrumb, ...cfg.params };
+      return cfg;
     });
 
     // Instrument API call timings → stderr
@@ -74,7 +113,7 @@ class FlatbottomPhil {
     }
 
     this.setupToolHandlers();
-    this.setupTokenRefresh();
+    this.setupCrumbRefresh();
 
     this.server.onerror = (error) => console.error('[Phil Error]', error);
     process.on('SIGINT', async () => {
@@ -86,33 +125,48 @@ class FlatbottomPhil {
   // --- Utilities ---
 
   private authHeaders() {
-    return { Authorization: `Bearer ${accessToken}` };
+    return {
+      Cookie: yahooCookies,
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      Referer: 'https://baseball.fantasysports.yahoo.com/',
+    };
   }
 
-  // On 401, attempt a token refresh and retry the original request once.
-  private setupTokenRefresh() {
+  private crumbParam() {
+    return { crumb: yahooCrumb };
+  }
+
+  // Fetch a fresh crumb from the Yahoo Fantasy page when the current one expires.
+  private async fetchFreshCrumb(): Promise<string> {
+    const res = await axios.get('https://baseball.fantasysports.yahoo.com/b1/87466', {
+      headers: { ...this.authHeaders(), Accept: 'text/html' },
+      maxRedirects: 5,
+    });
+    const match = (res.data as string).match(/crumb=(fantasy_apis\|[A-Za-z0-9_-]+)/);
+    if (!match) throw new Error('Could not extract crumb from Yahoo Fantasy page');
+    return match[1]!;
+  }
+
+  // On 401, attempt a crumb refresh and retry the original request once.
+  private setupCrumbRefresh() {
     this.yahooApi.interceptors.response.use(
       (res) => res,
       async (error) => {
-        if (error.response?.status !== 401 || error.config?._retried || !refreshToken) {
+        if (error.response?.status !== 401 || error.config?._retried) {
           return Promise.reject(error);
         }
         try {
-          const credentials = Buffer.from(`${YAHOO_CLIENT_ID}:${YAHOO_CLIENT_SECRET}`).toString('base64');
-          const params = new URLSearchParams();
-          params.append('grant_type', 'refresh_token');
-          params.append('refresh_token', refreshToken);
-          const { data } = await axios.post('https://api.login.yahoo.com/oauth2/get_token', params.toString(), {
-            headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-          });
-          accessToken = data.access_token;
-          if (data.refresh_token) refreshToken = data.refresh_token;
-          console.error('[Auth] Token refreshed automatically.');
+          console.error('[Auth] 401 received — refreshing crumb...');
+          yahooCrumb = await this.fetchFreshCrumb();
+          persistCookiesAndCrumb(yahooCookies, yahooCrumb);
           error.config._retried = true;
-          error.config.headers['Authorization'] = `Bearer ${accessToken}`;
+          // Update crumb in the retried request URL
+          const url: string = error.config.url ?? '';
+          error.config.url = url.replace(/crumb=[^&]+/, `crumb=${encodeURIComponent(yahooCrumb)}`);
+          if (error.config.params) error.config.params.crumb = yahooCrumb;
           return this.yahooApi.request(error.config);
         } catch (refreshError) {
-          console.error('[Auth] Token refresh failed. Run: npm run refresh-token');
+          console.error('[Auth] Crumb refresh failed — cookies may have expired. Paste fresh cookies via YAHOO_COOKIES env var.');
           return Promise.reject(error);
         }
       }
@@ -562,6 +616,25 @@ class FlatbottomPhil {
           },
         },
         {
+          name: 'get_player_performance',
+          description:
+            'Statcast-powered performance profile for any player(s). ' +
+            'Returns fantasy scoring stats alongside advanced metrics (xERA, Barrel%, wOBA, Hard Hit%, fWAR, SwStr%, etc.), ' +
+            'plus opinionated signals: BABIP luck, ERA vs xERA delta, contact quality tier, and ADP over/underperformance verdict. ' +
+            'Works for any rostered or free-agent player.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              players: {
+                type: 'string',
+                description: 'Player name or comma-separated list (e.g. "Ohtani" or "Raleigh, Messick, Adell")',
+              },
+            },
+            required: ['players'],
+            additionalProperties: false,
+          },
+        },
+        {
           name: 'get_opponent_scouting',
           description:
             'Deep dive on your current week\'s matchup opponent. ' +
@@ -571,6 +644,20 @@ class FlatbottomPhil {
             type: 'object',
             properties: {
               week: { type: 'number', description: 'Scoring week to scout (default: current week)' },
+            },
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'get_current_lineup',
+          description:
+            'Shows your current lineup for a given date — who is in each active slot, who is on BN/IL, ' +
+            'and any issues: injured players in active slots, IL-eligible players sitting on BN, or empty active slots. ' +
+            'Also compares current assignments against the optimal lineup and flags mismatches.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              date: { type: 'string', description: 'Date to check in YYYY-MM-DD format (default: today)' },
             },
             additionalProperties: false,
           },
@@ -662,6 +749,84 @@ class FlatbottomPhil {
             additionalProperties: false,
           },
         },
+        {
+          name: 'get_rotowire_data',
+          description:
+            'Fetches player and game data from RotoWire. ' +
+            'Five data types: player_news (last 3 news items + advice blurbs — replaces broken MLB RSS), ' +
+            'probable_starters (confirmed SPs for a given date with ERA/WHIP/K), ' +
+            'pitcher_usage (avg pitch count, % reaching 5+/6+/7+ IP, deep-start risk — calculated from game log), ' +
+            'player_outlook (current season fantasy outlook blurb), ' +
+            'injury_report (all MLB injuries with status and return timeline, optionally filtered by team). ' +
+            'Cache TTL is 30 minutes. Pass force_refresh=true to bust the cache.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              data_type: {
+                type: 'string',
+                enum: ['player_news', 'probable_starters', 'pitcher_usage', 'player_outlook', 'injury_report'],
+                description: 'Type of data to fetch',
+              },
+              player_name: {
+                type: 'string',
+                description: 'Full player name — required for player_news, pitcher_usage, player_outlook',
+              },
+              date: {
+                type: 'string',
+                description: 'Date in YYYY-MM-DD format (default: today) — used for probable_starters and injury_report',
+              },
+              team: {
+                type: 'string',
+                description: 'MLB team abbreviation (e.g. "TOR", "CLE") to filter probable_starters or injury_report',
+              },
+              force_refresh: {
+                type: 'boolean',
+                description: 'Bypass the 30-minute cache and re-fetch from RotoWire',
+              },
+            },
+            required: ['data_type'],
+            additionalProperties: false,
+          },
+        },
+        {
+          name: 'get_baseball_reference_stats',
+          description:
+            'Fetches and parses player data from Baseball Reference. ' +
+            'Supports five stat types: splits (vs L/R, home/away, day/night, monthly), ' +
+            'park_factors (OPS+/ERA+ park-adjusted stats), ' +
+            'plate_discipline (K%, BB%, SwStr% from advanced tables), ' +
+            'career_trajectory (year-by-year with decline flags — auto-detects retired players and returns full career), ' +
+            'and minor_league (MiLB stats by level with K%, BB%, ISO). ' +
+            'Responses are cached for 24 hours. Use for cold-streak diagnosis, park adjustments, and prospect validation.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              player_name: { type: 'string', description: 'Full player name (e.g. "Gleyber Torres")' },
+              stat_type: {
+                type: 'string',
+                enum: ['splits', 'park_factors', 'plate_discipline', 'career_trajectory', 'minor_league'],
+                description: 'Type of data to fetch',
+              },
+              year: { type: 'number', description: 'Season year (default: 2026)' },
+              split_type: {
+                type: 'string',
+                enum: ['vs_left', 'vs_right', 'home_away', 'day_night', 'monthly'],
+                description: 'Required when stat_type is "splits"',
+              },
+              year_range: {
+                type: 'array',
+                items: { type: 'number' },
+                description: 'Optional [start_year, end_year] to pin an exact range for career_trajectory (e.g. [2018, 2023]). Overrides auto-detection.',
+              },
+              force_refresh: {
+                type: 'boolean',
+                description: 'Bypass the 24-hour cache and re-fetch from BR. Use when a previous call returned stale or null data.',
+              },
+            },
+            required: ['player_name', 'stat_type'],
+            additionalProperties: false,
+          },
+        },
       ],
     }));
 
@@ -718,8 +883,12 @@ class FlatbottomPhil {
             return await this.autoGenerateTradePitch(request.params.arguments);
           case 'get_player_news':
             return await this.getPlayerNews(request.params.arguments);
+          case 'get_player_performance':
+            return await this.getPlayerPerformance(request.params.arguments);
           case 'get_opponent_scouting':
             return await this.getOpponentScouting(request.params.arguments);
+          case 'get_current_lineup':
+            return await this.getCurrentLineup(request.params.arguments);
           case 'set_lineup':
             return await this.setLineup(request.params.arguments);
           case 'get_faab_budget':
@@ -730,6 +899,10 @@ class FlatbottomPhil {
             return await this.getCategoryStandings();
           case 'get_pitcher_starts':
             return await this.getPitcherStarts(request.params.arguments);
+          case 'get_rotowire_data':
+            return await this.getRotowireData(request.params.arguments);
+          case 'get_baseball_reference_stats':
+            return await this.getBaseballReferenceStats(request.params.arguments);
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
         }
@@ -3030,6 +3203,163 @@ class FlatbottomPhil {
     };
   }
 
+  // Advanced stat ID → label maps decoded from live API probing
+  private static readonly BATTER_ADV: Record<string, string> = {
+    '1002': 'ISO',
+    '1003': 'Barrels',
+    '1005': 'Hard Hit%',
+    '1006': 'Barrel%',
+    '1008': 'fWAR',
+    '1009': 'Avg Launch Angle',
+    '1010': 'GB%',
+    '1011': 'Barrels',
+    '1013': 'BABIP',
+    '1014': 'wOBA',
+    '1035': 'BB%',
+  };
+
+  private static readonly PITCHER_ADV: Record<string, string> = {
+    '1019': 'Avg Velo',
+    '1020': 'fWAR',
+    '1021': 'GB%',
+    '1022': 'FB%',
+    '1028': 'xBA against',
+    '1029': 'xwOBA against',
+    '1030': 'wOBA against',
+    '1031': 'BABIP against',
+    '1032': 'xERA',
+    '1036': 'BB%',
+    '1037': 'K%',
+    '1038': 'SwStr%',
+  };
+
+  private static readonly BATTER_SCORING: Record<string, string> = {
+    '3': 'AVG', '4': 'OBP', '5': 'SLG', '7': 'R', '12': 'HR',
+    '13': 'RBI', '16': 'SB', '18': 'BB', '21': 'K', '55': 'OPS',
+  };
+
+  private static readonly PITCHER_SCORING: Record<string, string> = {
+    '25': 'GS', '26': 'ERA', '27': 'WHIP', '28': 'W', '32': 'SV',
+    '42': 'K', '47': 'SVOP', '48': 'HLD', '50': 'IP', '83': 'QS',
+  };
+
+  private async getPlayerPerformance(args: any) {
+    const playerNames: string[] = (args.players as string)
+      .split(',')
+      .map((s: string) => s.trim())
+      .filter(Boolean);
+
+    const leagueKey = await this.buildLeagueKey();
+    const results: any[] = [];
+
+    for (const name of playerNames) {
+      try {
+        const searchRes = await this.yahooApi.get(
+          `/league/${leagueKey}/players;search=${encodeURIComponent(name)};out=stats,draft_analysis`,
+          { headers: this.authHeaders(), params: { format: 'json' } }
+        );
+
+        const playersData = searchRes.data.fantasy_content.league[1].players;
+        if (!playersData || playersData.count === 0) {
+          results.push({ query: name, error: 'Player not found' });
+          continue;
+        }
+
+        const playerEntry = playersData[0].player;
+        const infoArr: any[] = playerEntry[0];
+        const statsBlock = playerEntry[1] ?? {};
+        const draftArr: any[] = playerEntry[2]?.draft_analysis ?? [];
+
+        const info = parsePlayerInfo(infoArr);
+        const positionType: string =
+          infoArr.find((x: any) => x?.position_type !== undefined)?.position_type ?? '';
+        const isPitcher = positionType === 'P';
+
+        // Parse fantasy scoring stats
+        const fantasyRaw: Record<string, string> = {};
+        for (const s of statsBlock?.player_stats?.stats ?? []) {
+          if (s.stat) fantasyRaw[String(s.stat.stat_id)] = s.stat.value ?? '';
+        }
+
+        // Parse advanced/Statcast stats
+        const advRaw: Record<string, string> = {};
+        for (const s of statsBlock?.player_advanced_stats?.stats ?? []) {
+          if (s.stat) advRaw[String(s.stat.stat_id)] = s.stat.value ?? '';
+        }
+
+        // Draft info
+        const avgPick = parseFloat(draftArr.find((x: any) => x?.average_pick)?.average_pick ?? 'NaN');
+        const avgCost = parseFloat(draftArr.find((x: any) => x?.average_cost)?.average_cost ?? 'NaN');
+        const adpTier = adpTierLabel(isNaN(avgPick) ? null : avgPick);
+
+        // Build labeled outputs
+        const advMap = isPitcher ? FlatbottomPhil.PITCHER_ADV : FlatbottomPhil.BATTER_ADV;
+        const advancedStats: Record<string, string> = {};
+        for (const [id, label] of Object.entries(advMap)) {
+          if (advRaw[id] && advRaw[id] !== '-') advancedStats[label] = advRaw[id]!;
+        }
+
+        const scoringMap = isPitcher ? FlatbottomPhil.PITCHER_SCORING : FlatbottomPhil.BATTER_SCORING;
+        const scoringStats: Record<string, string> = {};
+        for (const [id, label] of Object.entries(scoringMap)) {
+          if (fantasyRaw[id] && fantasyRaw[id] !== '-') scoringStats[label] = fantasyRaw[id]!;
+        }
+
+        // --- Performance signals ---
+        const signals: string[] = isPitcher
+          ? generatePitcherSignals({
+              era:          parseFloat(fantasyRaw['26']   ?? 'NaN'),
+              xera:         parseFloat(advRaw['1032']     ?? 'NaN'),
+              kPct:         parseFloat(advRaw['1037']     ?? 'NaN'),
+              bbPct:        parseFloat(advRaw['1036']     ?? 'NaN'),
+              swStr:        parseFloat(advRaw['1038']     ?? 'NaN'),
+              babipAgainst: parseFloat(advRaw['1031']     ?? 'NaN'),
+              fwar:         parseFloat(advRaw['1020']     ?? 'NaN'),
+              ip:           parseFloat(fantasyRaw['50']   ?? 'NaN'),
+              avgPick:      isNaN(avgPick) ? null : avgPick,
+            })
+          : generateBatterSignals({
+              babip:       parseFloat(advRaw['1013']     ?? 'NaN'),
+              woba:        parseFloat(advRaw['1014']     ?? 'NaN'),
+              barrelPct:   parseFloat(advRaw['1006']     ?? 'NaN'),
+              hardHit:     parseFloat(advRaw['1005']     ?? 'NaN'),
+              fwar:        parseFloat(advRaw['1008']     ?? 'NaN'),
+              gamesPlayed: parseInt(fantasyRaw['1']      ?? '0', 10),
+              avgPick:     isNaN(avgPick) ? null : avgPick,
+            });
+
+        results.push({
+          player: info.name,
+          query: name,
+          team: info.mlbTeam,
+          position: info.position,
+          type: isPitcher ? 'pitcher' : 'batter',
+          adp: {
+            average_pick: isNaN(avgPick) ? null : Math.round(avgPick * 10) / 10,
+            average_cost: isNaN(avgCost) ? null : Math.round(avgCost * 10) / 10,
+            tier: adpTier,
+          },
+          scoring_stats: scoringStats,
+          advanced_stats: advancedStats,
+          signals,
+        });
+      } catch (err: any) {
+        results.push({ query: name, error: err?.message ?? 'Unknown error' });
+      }
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          as_of: new Date().toISOString().slice(0, 10),
+          note: 'Advanced stats from Yahoo/Statcast. fWAR pace extrapolated from games/IP played to date.',
+          results,
+        }, null, 2),
+      }],
+    };
+  }
+
   private async getOpponentScouting(args: any) {
     const leagueKey = await this.buildLeagueKey();
     const myTeamKey = await this.buildTeamKey();
@@ -3177,6 +3507,129 @@ class FlatbottomPhil {
           attack_categories: attack,
           defend_categories: defend,
           note: 'attack = opponent bottom 40% in that category season-to-date. defend = they\'re top 30%.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  private async getCurrentLineup(args: any) {
+    const date: string = args?.date ?? new Date().toISOString().slice(0, 10);
+    const leagueKey = await this.buildLeagueKey();
+    const teamKey = await this.buildTeamKey();
+
+    const [settingsRes, rosterRes] = await Promise.all([
+      this.yahooApi.get(`/league/${leagueKey}/settings`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+      this.yahooApi.get(`/team/${teamKey}/roster;date=${date}/players`, {
+        headers: this.authHeaders(),
+        params: { format: 'json' },
+      }),
+    ]);
+
+    // Slot configuration
+    const rosterPosList: any[] = settingsRes.data.fantasy_content.league[1]?.settings?.[0]?.roster_positions ?? [];
+    const slotCounts: Record<string, number> = {};
+    for (const rp of rosterPosList) {
+      if (rp.roster_position?.position && rp.roster_position?.count) {
+        slotCounts[rp.roster_position.position] = (slotCounts[rp.roster_position.position] ?? 0) + Number(rp.roster_position.count);
+      }
+    }
+
+    const IL_SLOTS = ['IL', 'IL+', 'NA'];
+    const rosterObj = rosterRes.data.fantasy_content.team[1].roster;
+    const playersMap = extractPlayersMap(rosterObj);
+
+    type PlayerRow = {
+      playerKey: string; name: string; position: string; mlbTeam: string;
+      currentSlot: string; eligiblePositions: string[]; isInjured: boolean;
+      status?: string; injuryNote?: string;
+    };
+
+    const players: PlayerRow[] = [];
+    for (const [k, v] of Object.entries(playersMap) as [string, any][]) {
+      if (k === 'count') continue;
+      const infoArr: any[] = v.player[0];
+      const info = parsePlayerInfo(infoArr);
+      const eligRaw = extractField(infoArr, 'eligible_positions');
+      const eligiblePositions: string[] = Array.isArray(eligRaw)
+        ? eligRaw.map((e: any) => e?.position).filter(Boolean)
+        : [];
+      const selectedPos: any[] = v.player[1]?.selected_position ?? [];
+      const currentSlot = selectedPos.find((x: any) => x.position !== undefined)?.position ?? '?';
+      players.push({
+        playerKey: info.playerKey,
+        name: info.name,
+        position: info.position,
+        mlbTeam: info.mlbTeam,
+        currentSlot,
+        eligiblePositions,
+        isInjured: !!(info.status || info.injuryNote),
+        ...(info.status    ? { status: info.status }       : {}),
+        ...(info.injuryNote ? { injuryNote: info.injuryNote } : {}),
+      });
+    }
+
+    // Group by slot category
+    const activeSlots = Object.keys(slotCounts).filter((s) => !IL_SLOTS.includes(s) && s !== 'BN');
+    const active  = players.filter((p) => activeSlots.includes(p.currentSlot));
+    const bench   = players.filter((p) => p.currentSlot === 'BN');
+    const il      = players.filter((p) => IL_SLOTS.includes(p.currentSlot));
+
+    // Issues
+    const issues: string[] = [];
+
+    // Injured players in active slots
+    for (const p of active) {
+      if (p.isInjured) {
+        const canIL = p.eligiblePositions.some((pos) => IL_SLOTS.includes(pos));
+        issues.push(`⚠ ${p.name} is injured (${p.status ?? p.injuryNote}) but starting in ${p.currentSlot}${canIL ? ' — IL-eligible, should be moved' : ''}`);
+      }
+    }
+
+    // IL-eligible players sitting on BN
+    for (const p of bench) {
+      if (p.isInjured && p.eligiblePositions.some((pos) => IL_SLOTS.includes(pos))) {
+        issues.push(`⚠ ${p.name} is IL-eligible (${p.status ?? p.injuryNote}) but sitting on BN — move to IL to open a roster spot`);
+      }
+    }
+
+    // Empty active slots
+    const filledSlots = active.map((p) => p.currentSlot);
+    for (const slot of activeSlots) {
+      const filled = filledSlots.filter((s) => s === slot).length;
+      const capacity = slotCounts[slot] ?? 0;
+      if (filled < capacity) {
+        issues.push(`⚠ ${slot} slot has ${capacity - filled} empty spot(s)`);
+      }
+    }
+
+    // Optimal lineup comparison
+    const optimalInputs = players.map((p) => ({
+      playerKey: p.playerKey,
+      eligiblePositions: p.eligiblePositions,
+      isInjured: p.isInjured,
+    }));
+    const optimal = buildOptimalLineup(optimalInputs, slotCounts, IL_SLOTS);
+    const mismatches: string[] = [];
+    for (const o of optimal) {
+      const p = players.find((pl) => pl.playerKey === o.playerKey);
+      if (p && p.currentSlot !== o.position) {
+        mismatches.push(`${p.name}: currently ${p.currentSlot} → optimal ${o.position}`);
+      }
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          date,
+          active:  active.map(({ playerKey: _k, eligiblePositions: _e, ...rest }) => rest),
+          bench:   bench.map(({ playerKey: _k, eligiblePositions: _e, ...rest }) => rest),
+          il:      il.map(({ playerKey: _k, eligiblePositions: _e, ...rest }) => rest),
+          issues:  issues.length ? issues : ['No issues found'],
+          optimal_mismatches: mismatches.length ? mismatches : ['Lineup matches optimal'],
         }, null, 2),
       }],
     };
@@ -3604,6 +4057,897 @@ class FlatbottomPhil {
         }, null, 2),
       }],
     };
+  }
+
+  // ---- RotoWire scraping ----
+
+  private async rwFetch(url: string): Promise<string> {
+    await new Promise(r => setTimeout(r, 1500));
+    const res = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.rotowire.com/baseball/',
+      },
+      timeout: 20000,
+      maxRedirects: 10,
+    });
+    return res.data as string;
+  }
+
+  // Resolve a player name to their RotoWire player page URL and ID.
+  // Player ID resolutions are cached for 24 hours since IDs are stable.
+  private async resolveRWPlayer(name: string): Promise<
+    | { id: string; slug: string; name: string; url: string }
+    | { error: string; matches?: string[] }
+  > {
+    const pidKey = `rw_pid|${name.toLowerCase().replace(/\s+/g, '_')}`;
+    const pidCached = this.rwCache.get(pidKey);
+    if (pidCached && Date.now() - pidCached.fetchedAt < this.RW_PID_CACHE_TTL) {
+      return pidCached.data as { id: string; slug: string; name: string; url: string };
+    }
+
+    const html = await this.rwFetch(
+      `https://www.rotowire.com/baseball/search.php?searchname=${encodeURIComponent(name)}&sport=baseball`,
+    );
+    const $ = cheerio.load(html);
+
+    // Collect all player page links from search results
+    const seen = new Set<string>();
+    const links: Array<{ name: string; id: string; slug: string; url: string }> = [];
+    $('a[href*="/baseball/player/"]').each((_, el) => {
+      const href = $(el).attr('href') ?? '';
+      const text = $(el).text().trim();
+      const m = href.match(/\/baseball\/player\/([a-z0-9-]+)-(\d+)\.htm/i);
+      if (m && text && !seen.has(m[2]!)) {
+        seen.add(m[2]!);
+        links.push({
+          name: text,
+          id: m[2]!,
+          slug: m[1]!,
+          url: href.startsWith('http') ? href : `https://www.rotowire.com${href}`,
+        });
+      }
+    });
+
+    if (links.length === 0) return { error: `No RotoWire player found matching "${name}". Try the full name.` };
+
+    const nameLower = name.toLowerCase();
+    const exact = links.find(l => l.name.toLowerCase() === nameLower);
+
+    if (links.length > 1 && !exact) {
+      return {
+        error: `Ambiguous name "${name}". Matches: ${links.slice(0, 5).map(l => l.name).join(', ')}. Use the exact full name.`,
+        matches: links.map(l => l.name),
+      };
+    }
+
+    const result = exact ?? links[0]!;
+    this.rwCache.set(pidKey, { data: result, fetchedAt: Date.now() });
+    return result;
+  }
+
+  private async rwPlayerNews(playerName: string) {
+    const player = await this.resolveRWPlayer(playerName);
+    if ('error' in player) return player;
+
+    const html = await this.rwFetch(player.url);
+    const $ = cheerio.load(html);
+
+    const items: any[] = [];
+
+    // Try RotoWire's common news item selectors, most specific first
+    const selectors = [
+      '.news-item', '[class*="news-item"]', '[class*="is-player-news"]',
+      '[class*="player-news"]', '[class*="news__item"]',
+    ];
+
+    for (const sel of selectors) {
+      $(sel).slice(0, 3).each((_, el) => {
+        const $el = $(el);
+        const date = $el.find('[class*="date"], time').first().text().trim()
+          || ($el.find('time').attr('datetime') ?? '');
+        const headline = $el.find('[class*="headline"], h3, h4, strong').first().text().trim();
+        const analysis = $el.find('[class*="analy"], [class*="blurb"], p').first().text().trim();
+        if (headline || analysis) items.push({ date: date || null, headline: headline || null, analysis: analysis || null });
+      });
+      if (items.length > 0) break;
+    }
+
+    // Last resort: grab raw text from any news section
+    if (items.length === 0) {
+      const rawText = $('[id*="news"], [class*="news"]').first().text().trim();
+      if (rawText.length > 20) items.push({ date: null, headline: null, analysis: rawText.slice(0, 600) });
+    }
+
+    if (items.length === 0) {
+      return { error: `No news items parsed for "${playerName}".`, player_url: player.url };
+    }
+    return { player: player.name, player_url: player.url, news: items };
+  }
+
+  private async rwProbableStarters(date: string, team?: string) {
+    // RotoWire's probable starters page is JS-rendered — the raw HTML is a skeleton
+    // with no game data. Use the MLB Stats API instead, which returns structured JSON
+    // and is the authoritative source for probable pitcher data anyway.
+    const res = await this.mlbApi.get('/schedule', {
+      params: {
+        sportId: 1,
+        date,
+        hydrate: 'probablePitcher(note,stats(group=[pitching],type=[season]))',
+        fields: 'dates,date,games,gameDate,status,detailedState,teams,home,away,team,name,abbreviation,probablePitcher,fullName,id,note,stats,type,displayName,group,splits,stat,era,whip,strikeOuts,inningsPitched',
+      },
+    });
+
+    const games: any[] = res.data?.dates?.[0]?.games ?? [];
+    if (games.length === 0) {
+      return { date, source: 'MLB Stats API', starters: [], note: 'No games scheduled for this date.' };
+    }
+
+    const starters: any[] = [];
+    for (const game of games) {
+      if (game.status?.detailedState === 'Postponed') continue;
+
+      const gameTime = new Date(game.gameDate).toLocaleTimeString('en-US', {
+        hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York', hour12: true,
+      }) + ' ET';
+
+      for (const side of ['away', 'home'] as const) {
+        const teamData = game.teams[side];
+        const pitcher = teamData?.probablePitcher;
+        if (!pitcher?.fullName) continue;
+
+        const teamAbbr: string = teamData.team?.abbreviation ?? '?';
+        const opponent: string = game.teams[side === 'away' ? 'home' : 'away']?.team?.abbreviation ?? '?';
+        if (team && teamAbbr.toUpperCase() !== team.toUpperCase()) continue;
+
+        // Season stats from hydrated response (may be absent early in season)
+        const seasonStat = pitcher.stats
+          ?.find((s: any) => s.group?.displayName === 'pitching' && s.type?.displayName === 'season')
+          ?.splits?.[0]?.stat;
+
+        starters.push({
+          pitcher: pitcher.fullName,
+          team: teamAbbr,
+          opponent,
+          home_away: side,
+          game_time: gameTime,
+          era: seasonStat?.era ?? null,
+          whip: seasonStat?.whip ?? null,
+          k: seasonStat?.strikeOuts ?? null,
+          ip: seasonStat?.inningsPitched ?? null,
+          note: pitcher.note ?? null,
+        });
+      }
+    }
+
+    return {
+      date,
+      source: 'MLB Stats API',
+      starters,
+      ...(starters.length === 0 && { warning: 'No probable pitchers posted yet for this date.' }),
+    };
+  }
+
+  // Derives usage metrics by parsing the pitcher's game log table directly.
+  // More reliable than scraping the "Appearances Breakdown" widget, which is often JS-rendered.
+  private async rwPitcherUsage(playerName: string) {
+    const player = await this.resolveRWPlayer(playerName);
+    if ('error' in player) return player;
+
+    const html = await this.rwFetch(player.url);
+    const $ = cheerio.load(html);
+
+    // Find game log table — RotoWire pitcher pages have a per-start stats table
+    const tableSelectors = [
+      '.player-game-log table',
+      '[class*="game-log"] table',
+      'table[class*="player-stats"]',
+      'table[class*="player-game"]',
+    ];
+
+    let ipCol = -1, pcCol = -1;
+    let gameTable: ReturnType<typeof $> | null = null;
+
+    for (const sel of tableSelectors) {
+      const t = $(sel).first();
+      if (!t.length) continue;
+      t.find('thead th, thead td').each((i, th) => {
+        const text = $(th).text().trim().toUpperCase();
+        if (text === 'IP') ipCol = i;
+        if (text === 'PC' || text === 'P' || text === 'PITCHES') pcCol = i;
+      });
+      if (ipCol >= 0) { gameTable = t; break; }
+    }
+
+    const starts: Array<{ ip: number; pc: number | null }> = [];
+    if (gameTable && ipCol >= 0) {
+      gameTable.find('tbody tr').each((_, row) => {
+        const cells = $(row).find('td');
+        const ipText = $(cells[ipCol]).text().trim();
+        // RotoWire uses fractional notation: 6.1 = 6 1/3, 6.2 = 6 2/3
+        const ipNum = parseFloat(ipText);
+        if (!isNaN(ipNum) && ipNum > 0) {
+          const pcText = pcCol >= 0 ? $(cells[pcCol]).text().trim() : '';
+          const pcNum = pcText ? parseInt(pcText) : null;
+          starts.push({ ip: ipNum, pc: pcNum });
+        }
+      });
+    }
+
+    if (starts.length > 0) {
+      const total = starts.length;
+      const allPcs = starts.map(s => s.pc).filter((p): p is number => p !== null);
+      const avg = (arr: number[]) => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null;
+
+      const pctReaching = (threshold: number) =>
+        Math.round((starts.filter(s => s.ip >= threshold).length / total) * 100);
+      const pct6 = pctReaching(6);
+
+      const avgIp = starts.reduce((a, s) => a + s.ip, 0) / total;
+
+      return {
+        player: player.name,
+        player_url: player.url,
+        games_analyzed: total,
+        avg_pitch_count: {
+          all_games: avg(allPcs),
+          last_10: avg(allPcs.slice(-10)),
+          last_5: avg(allPcs.slice(-5)),
+        },
+        avg_ip: Math.round(avgIp * 10) / 10,
+        pct_reaching_innings: {
+          '5+': pctReaching(5),
+          '6+': pct6,
+          '7+': pctReaching(7),
+        },
+        typical_innings: `${Math.floor(avgIp)}-${Math.ceil(avgIp)}`,
+        deep_start_risk: pct6 >= 60 ? 'low' : pct6 >= 40 ? 'medium' : 'high',
+      };
+    }
+
+    return {
+      player: player.name,
+      player_url: player.url,
+      error: 'Game log table not found. Player may be a reliever, or RotoWire HTML changed.',
+    };
+  }
+
+  private async rwPlayerOutlook(playerName: string) {
+    const player = await this.resolveRWPlayer(playerName);
+    if ('error' in player) return player;
+
+    const html = await this.rwFetch(player.url);
+    const $ = cheerio.load(html);
+
+    const outlookSelectors = [
+      '[class*="outlook"]', '[class*="fantasy-outlook"]',
+      '[id*="outlook"]', '.player-outlook', '[class*="player-profile-outlook"]',
+    ];
+
+    let current: string | null = null;
+    let prior: string | null = null;
+
+    for (const sel of outlookSelectors) {
+      const el = $(sel).first();
+      if (!el.length) continue;
+      const paras = el.find('p');
+      if (paras.length >= 2) {
+        current = paras.eq(0).text().trim();
+        prior = paras.eq(1).text().trim();
+      } else {
+        current = el.text().trim() || null;
+      }
+      if (current && current.length > 20) break;
+    }
+
+    if (!current) {
+      return { player: player.name, player_url: player.url, error: 'Outlook section not found on player page.' };
+    }
+    return { player: player.name, player_url: player.url, current_outlook: current, prior_outlook: prior };
+  }
+
+  private async rwInjuryReport(team?: string) {
+    const html = await this.rwFetch('https://www.rotowire.com/baseball/injury-report.php');
+    const $ = cheerio.load(html);
+    const injuries: any[] = [];
+
+    // Primary: standard <table> structure
+    // Typical RotoWire column order: Player | Pos | Team | Injury | Status | Est. Return
+    $('table tbody tr').each((_, row) => {
+      const $row = $(row);
+      const cells = $row.find('td');
+      if (cells.length < 4) return;
+      const playerName = $(cells[0]).find('a').text().trim() || $(cells[0]).text().trim();
+      const pos = $(cells[1]).text().trim();
+      const teamAbbr = $(cells[2]).text().trim();
+      const injury = $(cells[3]).text().trim();
+      const status = $(cells[4])?.text().trim() ?? '';
+      const estReturn = $(cells[5])?.text().trim() ?? '';
+      if (!playerName || playerName.length < 2 || !injury) return;
+      if (team && teamAbbr.toUpperCase() !== team.toUpperCase()) return;
+      injuries.push({ player: playerName, position: pos, team: teamAbbr, injury, status: status || 'Unknown', est_return: estReturn || 'Unknown' });
+    });
+
+    // Fallback: div-based injury list (modern RotoWire layout)
+    if (injuries.length === 0) {
+      $('[class*="injury-report__player"], [class*="injury__player"], .injury-player').each((_, el) => {
+        const $el = $(el);
+        const playerName = $el.find('[class*="name"], a').first().text().trim();
+        const teamAbbr = $el.find('[class*="team"]').first().text().trim();
+        const status = $el.find('[class*="status"], [class*="type"]').first().text().trim();
+        const injury = $el.find('[class*="injury"], [class*="desc"]').first().text().trim();
+        if (!playerName) return;
+        if (team && teamAbbr.toUpperCase() !== team.toUpperCase()) return;
+        injuries.push({ player: playerName, position: '', team: teamAbbr, injury, status: status || 'Unknown', est_return: '' });
+      });
+    }
+
+    return {
+      as_of: new Date().toISOString().slice(0, 10),
+      ...(team && { team_filter: team }),
+      total: injuries.length,
+      injuries,
+      ...(injuries.length === 0 && { warning: 'No injuries parsed. RotoWire HTML structure may have changed.' }),
+    };
+  }
+
+  private async getRotowireData(args: any) {
+    const dataType: string = args.data_type;
+    const playerName: string | undefined = args.player_name;
+    const date: string = args.date ?? new Date().toISOString().slice(0, 10);
+    const team: string | undefined = args.team;
+    const forceRefresh: boolean = args.force_refresh === true;
+
+    const playerRequired = ['player_news', 'pitcher_usage', 'player_outlook'];
+    if (playerRequired.includes(dataType) && !playerName) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ error: `player_name is required for data_type "${dataType}"` }),
+        }],
+      };
+    }
+
+    const cacheKey = `rw|${dataType}|${playerName ?? ''}|${date}|${team ?? ''}`;
+    const cached = this.rwCache.get(cacheKey);
+    if (!forceRefresh && cached && Date.now() - cached.fetchedAt < this.RW_CACHE_TTL) {
+      return { content: [{ type: 'text', text: JSON.stringify(cached.data, null, 2) }] };
+    }
+    if (forceRefresh) this.rwCache.delete(cacheKey);
+
+    let data: any;
+    switch (dataType) {
+      case 'player_news':       data = await this.rwPlayerNews(playerName!); break;
+      case 'probable_starters': data = await this.rwProbableStarters(date, team); break;
+      case 'pitcher_usage':     data = await this.rwPitcherUsage(playerName!); break;
+      case 'player_outlook':    data = await this.rwPlayerOutlook(playerName!); break;
+      case 'injury_report':     data = await this.rwInjuryReport(team); break;
+      default: throw new Error(`Unknown data_type: ${dataType}`);
+    }
+
+    const result = {
+      source: 'RotoWire',
+      data_type: dataType,
+      fetched_at: new Date().toISOString(),
+      ...(playerName && { player_name: playerName }),
+      ...(team && { team_filter: team }),
+      data,
+    };
+
+    this.rwCache.set(cacheKey, { data: result, fetchedAt: Date.now() });
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  }
+
+  // ---- Baseball Reference scraping ----
+
+  // BR buries some tables in HTML comments for JS injection — strip comment markers
+  // so cheerio can parse them directly. Using replace() is simpler and more reliable
+  // than extracting and appending.
+  private extractBRCommentTables(html: string): string {
+    return html.replace(/<!--([\s\S]*?)-->/g, '$1');
+  }
+
+  // Safely extract year from a BR table row — handles both year_ID and year_id keys
+  private getBRYear(row: Record<string, string>): number {
+    const raw = row['year_ID'] ?? row['year_id'] ?? row['Year'] ?? '';
+    return parseInt(raw, 10);
+  }
+
+  // List which table IDs are present in an HTML string — useful for debugging
+  private listBRTableIds(html: string): string[] {
+    const ids: string[] = [];
+    const re = /id="([^"]+)"/g;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      if (m[1] && !ids.includes(m[1])) ids.push(m[1]!);
+    }
+    return ids.filter(id => /batting|pitching|standard|advanced|minor|splits/i.test(id));
+  }
+
+  // Parse a BR table by ID using data-stat attributes as keys
+  private parseBRTable(html: string, tableId: string): Record<string, string>[] | null {
+    const $ = cheerio.load(html);
+    const table = $(`#${tableId}`);
+    if (!table.length) return null;
+    const rows: Record<string, string>[] = [];
+    table.find('tbody tr').each((_, tr) => {
+      const $tr = $(tr);
+      if ($tr.hasClass('partial_table') || $tr.hasClass('spacer') || $tr.hasClass('thead')) return;
+      const row: Record<string, string> = {};
+      let hasContent = false;
+      $tr.find('td, th').each((_, cell) => {
+        const stat = $(cell).attr('data-stat');
+        if (stat) {
+          row[stat] = $(cell).text().trim();
+          if (row[stat]) hasContent = true;
+        }
+      });
+      if (hasContent) rows.push(row);
+    });
+    return rows.length > 0 ? rows : null;
+  }
+
+  // Fetch a page from Baseball Reference with rate-limit delay and browser-like headers
+  private async brFetch(path: string): Promise<string> {
+    await new Promise(r => setTimeout(r, 1500));
+    const res = await axios.get(`https://www.baseball-reference.com${path}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.baseball-reference.com/',
+      },
+      timeout: 20000,
+      maxRedirects: 10,
+    });
+    return res.data as string;
+  }
+
+  // Resolve a player name to a BR player ID. Returns error object on failure or ambiguity.
+  private async resolveBRPlayer(name: string): Promise<
+    | { id: string; name: string; type: 'b' | 'p'; letter: string }
+    | { error: string; matches?: string[] }
+  > {
+    const html = await this.brFetch(`/search/search.fcgi?search=${encodeURIComponent(name)}&results=player`);
+    const $ = cheerio.load(html);
+
+    // If axios followed a redirect to a player page, the canonical tag reveals the player URL
+    const canonical = $('link[rel="canonical"]').attr('href') ?? '';
+    const pageMatch = canonical.match(/\/players\/(\w)\/(\w+)\.shtml/);
+    if (pageMatch) {
+      const playerName = $('h1[itemprop="name"]').first().text().trim() || $('h1').first().text().trim();
+      const posText = $('#meta').text();
+      const isPitcher = /pitcher|SP\b|RP\b|starter|reliever/i.test(posText);
+      return { id: pageMatch[2]!, name: playerName || name, type: isPitcher ? 'p' : 'b', letter: pageMatch[1]! };
+    }
+
+    // Search results page — collect all player links
+    const links: Array<{ name: string; id: string; letter: string }> = [];
+    $('.search-result-name a').each((_, el) => {
+      const href = $(el).attr('href') ?? '';
+      const text = $(el).text().trim();
+      const m = href.match(/\/players\/(\w)\/(\w+)\.shtml/);
+      if (m) links.push({ name: text, id: m[2]!, letter: m[1]! });
+    });
+
+    if (links.length === 0) return { error: `No player found matching "${name}". Try using the full name.` };
+
+    if (links.length === 1) {
+      // Single match — fetch player page to determine pitcher vs. batter
+      const playerHtml = await this.brFetch(`/players/${links[0]!.letter}/${links[0]!.id}.shtml`);
+      const $p = cheerio.load(playerHtml);
+      const posText = $p('#meta').text();
+      const isPitcher = /pitcher|SP\b|RP\b|starter|reliever/i.test(posText);
+      return { ...links[0]!, name: links[0]!.name, type: isPitcher ? 'p' : 'b' };
+    }
+
+    return {
+      error: `Ambiguous name "${name}". Found: ${links.slice(0, 5).map(l => l.name).join(', ')}. Use the exact full name.`,
+      matches: links.map(l => l.name),
+    };
+  }
+
+  // Format a BR split row into the standard output shape
+  private formatBRSplitRow(row: Record<string, string>) {
+    const pa = parseFloat(row['PA'] ?? '0') || 1;
+    const so = parseFloat(row['SO'] ?? '0');
+    const bb = parseFloat(row['BB'] ?? '0');
+    return {
+      avg: row['batting_avg'] ?? null,
+      obp: row['onbase_perc'] ?? null,
+      slg: row['slugging_perc'] ?? null,
+      ops: row['onbase_plus_slugging'] ?? null,
+      hr: row['HR'] ?? null,
+      pa: row['PA'] ?? null,
+      ab: row['AB'] ?? null,
+      k_pct: isNaN(so / pa) ? null : Math.round((so / pa) * 1000) / 10,
+      bb_pct: isNaN(bb / pa) ? null : Math.round((bb / pa) * 1000) / 10,
+    };
+  }
+
+  private async brSplits(
+    player: { id: string; type: 'b' | 'p'; letter: string },
+    year: number,
+    splitType: string,
+  ) {
+    const tableMap: Record<string, string> = {
+      vs_left: 'plato',
+      vs_right: 'plato',
+      home_away: 'phome_away',
+      day_night: 'pday_night',
+      monthly: 'pmonth',
+    };
+    const tableId = tableMap[splitType];
+    if (!tableId) return { error: `Unknown split_type: ${splitType}` };
+
+    // Fetch requested year; fall back to prior year if the table is absent (BR split data
+    // often lags several weeks into the new season before it's published)
+    let html = await this.brFetch(`/players/split.fcgi?id=${player.id}&year=${year}&t=${player.type}`);
+    let expanded = this.extractBRCommentTables(html);
+    let rows = this.parseBRTable(expanded, tableId);
+    let dataYear = year;
+
+    if (!rows) {
+      const fallbackYear = year - 1;
+      html = await this.brFetch(`/players/split.fcgi?id=${player.id}&year=${fallbackYear}&t=${player.type}`);
+      expanded = this.extractBRCommentTables(html);
+      rows = this.parseBRTable(expanded, tableId);
+      dataYear = fallbackYear;
+    }
+
+    if (!rows) {
+      return {
+        error: `Split table "${tableId}" not found for ${year} or ${year - 1}.`,
+        hint: 'BR split data typically lags 4–6 weeks at the start of a new season.',
+      };
+    }
+
+    const yearNote = dataYear !== year ? `data_year: ${dataYear} (${year} not yet available)` : undefined;
+
+    if (splitType === 'monthly') {
+      const data = rows
+        .filter(r => r['split_name'] && !/Season|Total/i.test(r['split_name']))
+        .map(r => ({ month: r['split_name'], ...this.formatBRSplitRow(r) }));
+      return yearNote ? { note: yearNote, data } : data;
+    }
+
+    if (splitType === 'home_away' || splitType === 'day_night') {
+      const data = rows
+        .filter(r => r['split_name'])
+        .map(r => ({ split: r['split_name'], ...this.formatBRSplitRow(r) }));
+      return yearNote ? { note: yearNote, data } : data;
+    }
+
+    // vs_left / vs_right — find the matching platoon row
+    const targetRe = splitType === 'vs_left'
+      ? /vs LHP|vs L\b/i
+      : /vs RHP|vs R\b/i;
+    const row = rows.find(r => targetRe.test(r['split_name'] ?? ''));
+    if (!row) {
+      return {
+        error: `No "${splitType}" row found. Available splits: ${rows.map(r => r['split_name']).filter(Boolean).join(', ')}`,
+        ...(yearNote && { note: yearNote }),
+      };
+    }
+    return { ...(yearNote && { note: yearNote }), ...this.formatBRSplitRow(row) };
+  }
+
+  private async brCareerTrajectory(
+    player: { id: string; type: 'b' | 'p'; letter: string },
+    currentYear: number,
+    yearRange?: [number, number],
+  ) {
+    const html = await this.brFetch(`/players/${player.letter}/${player.id}.shtml`);
+    const expanded = this.extractBRCommentTables(html);
+
+    // BR table IDs on player pages use the "players_standard_*" prefix
+    const primaryId = player.type === 'p' ? 'players_standard_pitching' : 'players_standard_batting';
+    const fallbackId = player.type === 'p' ? 'players_standard_batting' : 'players_standard_pitching';
+    let rows = this.parseBRTable(expanded, primaryId);
+    if (!rows) rows = this.parseBRTable(expanded, fallbackId);
+    if (!rows) {
+      const found = this.listBRTableIds(expanded);
+      return {
+        error: `Stats table not found on player page. Searched for: "${primaryId}".`,
+        tables_found_on_page: found,
+        hint: 'BR may have changed their table IDs or this player has an unusual page structure.',
+      };
+    }
+
+    // All valid season rows (exclude career totals and non-year rows)
+    const allSeasonRows = rows.filter(r => !isNaN(this.getBRYear(r)));
+    if (allSeasonRows.length === 0) {
+      const allYears = rows.map(r => this.getBRYear(r)).filter(y => !isNaN(y)).sort();
+      return { error: 'No season rows found in stats table.', all_years_available: allYears };
+    }
+
+    const maxYear = Math.max(...allSeasonRows.map(r => this.getBRYear(r)));
+    const minYear = Math.min(...allSeasonRows.map(r => this.getBRYear(r)));
+
+    // Determine which rows to return
+    let yearRows: Record<string, string>[];
+    let playerStatus: 'active' | 'retired';
+    let rangeDescription: string;
+
+    if (yearRange) {
+      // Explicit override — honour it exactly
+      yearRows = allSeasonRows.filter(r => {
+        const y = this.getBRYear(r);
+        return y >= yearRange[0] && y <= yearRange[1];
+      });
+      playerStatus = maxYear >= currentYear - 1 ? 'active' : 'retired';
+      rangeDescription = `${yearRange[0]}–${yearRange[1]} (explicit range)`;
+    } else if (maxYear < currentYear - 1) {
+      // Player's last season was 2+ years ago — treat as retired, return full career
+      playerStatus = 'retired';
+      yearRows = allSeasonRows;
+      rangeDescription = `${minYear}–${maxYear} (full career)`;
+    } else {
+      // Active player — last 5 seasons + current
+      playerStatus = 'active';
+      yearRows = allSeasonRows.filter(r => {
+        const y = this.getBRYear(r);
+        return y >= currentYear - 5 && y <= currentYear;
+      });
+      rangeDescription = `${currentYear - 5}–${currentYear} (last 5 seasons)`;
+    }
+
+    if (yearRows.length === 0) {
+      return {
+        error: `No seasons found for the selected range.`,
+        player_status: playerStatus,
+        career_span: `${minYear}–${maxYear}`,
+        all_years_available: allSeasonRows.map(r => this.getBRYear(r)).sort(),
+      };
+    }
+
+    const seasons = yearRows.map(r => {
+      if (player.type === 'p') {
+        return {
+          year: r['year_ID'],
+          team: r['team_ID'],
+          age: r['age'],
+          w: r['W'], l: r['L'],
+          era: r['earned_run_avg'],
+          whip: r['whip'],
+          k: r['SO'], bb: r['BB'], ip: r['IP'],
+          era_plus: r['earned_run_avg_plus'] ?? null,
+          fwar: r['WAR'] ?? null,
+        };
+      }
+      return {
+        year: r['year_ID'],
+        team: r['team_ID'],
+        age: r['age'],
+        avg: r['batting_avg'],
+        obp: r['onbase_perc'],
+        slg: r['slugging_perc'],
+        ops: r['onbase_plus_slugging'],
+        ops_plus: r['onbase_plus_slugging_plus'] ?? null,
+        hr: r['HR'], rbi: r['RBI'], sb: r['SB'],
+        fwar: r['WAR'] ?? null,
+      };
+    });
+
+    // Flag significant year-over-year declines
+    const decline_flags: string[] = [];
+    for (let i = 1; i < seasons.length; i++) {
+      const prev = seasons[i - 1]!;
+      const curr = seasons[i]!;
+      if (player.type === 'p') {
+        const delta = parseFloat(curr.era ?? 'NaN') - parseFloat(prev.era ?? 'NaN');
+        if (!isNaN(delta) && delta > 0.75) {
+          decline_flags.push(`ERA rose ${prev.year}→${curr.year}: ${prev.era} → ${curr.era} (+${delta.toFixed(2)})`);
+        }
+        const warDelta = parseFloat(curr.fwar ?? 'NaN') - parseFloat(prev.fwar ?? 'NaN');
+        if (!isNaN(warDelta) && warDelta < -2) {
+          decline_flags.push(`fWAR dropped ${prev.year}→${curr.year}: ${prev.fwar} → ${curr.fwar}`);
+        }
+      } else {
+        const opsDelta = parseFloat(curr.ops ?? 'NaN') - parseFloat(prev.ops ?? 'NaN');
+        if (!isNaN(opsDelta) && opsDelta < -0.075) {
+          decline_flags.push(`OPS dropped ${prev.year}→${curr.year}: ${prev.ops} → ${curr.ops} (${opsDelta.toFixed(3)})`);
+        }
+        const warDelta = parseFloat(curr.fwar ?? 'NaN') - parseFloat(prev.fwar ?? 'NaN');
+        if (!isNaN(warDelta) && warDelta < -2) {
+          decline_flags.push(`fWAR dropped ${prev.year}→${curr.year}: ${prev.fwar} → ${curr.fwar}`);
+        }
+      }
+    }
+
+    return { player_status: playerStatus, range: rangeDescription, seasons, decline_flags };
+  }
+
+  private async brMinorLeague(player: { id: string; type: 'b' | 'p'; letter: string }) {
+    const html = await this.brFetch(`/players/${player.letter}/${player.id}.shtml`);
+    const expanded = this.extractBRCommentTables(html);
+    const tableId = player.type === 'p' ? 'pitching_minors' : 'batting_minors';
+    const rows = this.parseBRTable(expanded, tableId);
+    if (!rows) return { error: 'No minor league data found. Player may have no MiLB history on record.' };
+
+    return rows
+      .filter(r => r['year_ID'] && r['team_ID'])
+      .map(r => {
+        if (player.type === 'p') {
+          const bf = parseFloat(r['batters_faced'] ?? r['BFP'] ?? '0') || 1;
+          return {
+            year: r['year_ID'], team: r['team_ID'], level: r['lg_ID'], age: r['age'],
+            era: r['earned_run_avg'], whip: r['whip'], ip: r['IP'],
+            k_pct: r['SO'] ? `${Math.round((parseFloat(r['SO']) / bf) * 1000) / 10}%` : null,
+            bb_pct: r['BB'] ? `${Math.round((parseFloat(r['BB']) / bf) * 1000) / 10}%` : null,
+          };
+        }
+        const pa = parseFloat(r['PA'] ?? r['AB'] ?? '0') || 1;
+        const slg = parseFloat(r['slugging_perc'] ?? '0');
+        const avg = parseFloat(r['batting_avg'] ?? '0');
+        return {
+          year: r['year_ID'], team: r['team_ID'], level: r['lg_ID'], age: r['age'],
+          avg: r['batting_avg'], obp: r['onbase_perc'], slg: r['slugging_perc'],
+          iso: isNaN(slg - avg) ? null : Math.round((slg - avg) * 1000) / 1000,
+          hr: r['HR'],
+          k_pct: r['SO'] ? `${Math.round((parseFloat(r['SO']) / pa) * 1000) / 10}%` : null,
+          bb_pct: r['BB'] ? `${Math.round((parseFloat(r['BB']) / pa) * 1000) / 10}%` : null,
+        };
+      });
+  }
+
+  private async brParkFactors(
+    player: { id: string; type: 'b' | 'p'; letter: string },
+    year: number,
+  ) {
+    const html = await this.brFetch(`/players/${player.letter}/${player.id}.shtml`);
+    const expanded = this.extractBRCommentTables(html);
+    const tableId = player.type === 'p' ? 'players_standard_pitching' : 'players_standard_batting';
+    const rows = this.parseBRTable(expanded, tableId);
+
+    // Try exact year match, then with asterisk/dagger suffixes (e.g. "2026 *")
+    const yearRow = rows?.find(r => (r['year_ID'] ?? '').startsWith(String(year)));
+    if (!yearRow) {
+      return { error: `No ${year} season data found. Cannot compute park-adjusted stats.` };
+    }
+
+    const team = yearRow['team_ID'] ?? 'UNK';
+    const result: Record<string, any> = {
+      team,
+      year,
+      note: 'OPS+ and ERA+ are park-adjusted (100 = league avg). Raw park factor values available at baseball-reference.com/about/parkadjust.shtml.',
+    };
+
+    if (player.type === 'p') {
+      result.era_plus = yearRow['earned_run_avg_plus'] ?? null;
+      result.era = yearRow['earned_run_avg'] ?? null;
+      result.whip = yearRow['whip'] ?? null;
+    } else {
+      result.ops_plus = yearRow['onbase_plus_slugging_plus'] ?? null;
+      result.ops = yearRow['onbase_plus_slugging'] ?? null;
+      result.avg = yearRow['batting_avg'] ?? null;
+    }
+
+    return result;
+  }
+
+  private async brPlateDiscipline(
+    player: { id: string; name: string; type: 'b' | 'p'; letter: string },
+    year: number,
+  ) {
+    // Baseball Savant carries the full plate discipline suite (Chase%, O-Swing%, Z-Swing%,
+    // Contact%, SwStr%, F-Strike%). BR only has K%, BB%, and sometimes SwStr%.
+    // Always surface the Savant URL so the user can supplement.
+    const savantUrl = `https://baseballsavant.mlb.com/savant-search?player_type=${player.type === 'p' ? 'pitcher' : 'batter'}&player_name[]=${encodeURIComponent(player.name)}&game_year=${year}&min_pa=1`;
+
+    const html = await this.brFetch(`/players/${player.letter}/${player.id}.shtml`);
+    const expanded = this.extractBRCommentTables(html);
+
+    // Try advanced tables first, fall back to standard
+    const candidateTables = player.type === 'p'
+      ? ['players_standard_pitching', 'pitching_advanced']
+      : ['players_standard_batting', 'batting_advanced'];
+
+    let yearRow: Record<string, string> | undefined;
+    for (const tid of candidateTables) {
+      const rows = this.parseBRTable(expanded, tid);
+      yearRow = rows?.find(r => this.getBRYear(r) === year);
+      if (yearRow) break;
+    }
+
+    if (!yearRow) {
+      return {
+        br_data: null,
+        note: `BR does not carry full plate discipline for ${year}. Use Baseball Savant for Chase%, O-Swing%, Z-Swing%, Contact%, and SwStr%.`,
+        savant_url: savantUrl,
+      };
+    }
+
+    if (player.type === 'p') {
+      return {
+        year,
+        k_pct: yearRow['SO_perc'] ?? yearRow['strikeouts_nine'] ?? null,
+        bb_pct: yearRow['BB_perc'] ?? yearRow['walks_nine'] ?? null,
+        swstr_pct: yearRow['swstr_pct'] ?? null,
+        f_strike_pct: yearRow['f_strike_perc'] ?? null,
+        hr9: yearRow['home_runs_per_nine'] ?? null,
+        era_plus: yearRow['earned_run_avg_plus'] ?? null,
+        savant_url: savantUrl,
+        note: 'BR provides K%, BB%, SwStr%. For O-Swing%, Z-Contact%, Chase%, see savant_url.',
+      };
+    }
+
+    return {
+      year,
+      k_pct: yearRow['SO_perc'] ?? null,
+      bb_pct: yearRow['BB_perc'] ?? null,
+      babip: yearRow['batting_avg_bip'] ?? null,
+      ops_plus: yearRow['onbase_plus_slugging_plus'] ?? null,
+      savant_url: savantUrl,
+      note: 'BR provides K%, BB%, BABIP, OPS+. For Chase%, Zone%, Contact%, see savant_url.',
+    };
+  }
+
+  private async getBaseballReferenceStats(args: any) {
+    const playerName: string = args.player_name;
+    const statType: string = args.stat_type;
+    const year: number = args.year ?? 2026;
+    const splitType: string | undefined = args.split_type;
+    const yearRange: [number, number] | undefined = Array.isArray(args.year_range) && args.year_range.length === 2
+      ? [args.year_range[0] as number, args.year_range[1] as number]
+      : undefined;
+
+    if (statType === 'splits' && !splitType) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ error: 'split_type is required when stat_type is "splits"' }),
+        }],
+      };
+    }
+
+    const forceRefresh: boolean = args.force_refresh === true;
+    const cacheKey = `br|${playerName}|${statType}|${year}|${splitType ?? ''}|${yearRange?.join('-') ?? ''}`;
+    const cached = this.brCache.get(cacheKey);
+    if (!forceRefresh && cached && Date.now() - cached.fetchedAt < this.BR_CACHE_TTL) {
+      return { content: [{ type: 'text', text: JSON.stringify(cached.data, null, 2) }] };
+    }
+    if (forceRefresh) this.brCache.delete(cacheKey);
+
+    const playerInfo = await this.resolveBRPlayer(playerName);
+    if ('error' in playerInfo) {
+      return { content: [{ type: 'text', text: JSON.stringify(playerInfo, null, 2) }] };
+    }
+
+    let data: any;
+    switch (statType) {
+      case 'splits':
+        data = await this.brSplits(playerInfo, year, splitType!);
+        break;
+      case 'career_trajectory':
+        data = await this.brCareerTrajectory(playerInfo, year, yearRange);
+        break;
+      case 'minor_league':
+        data = await this.brMinorLeague(playerInfo);
+        break;
+      case 'park_factors':
+        data = await this.brParkFactors(playerInfo, year);
+        break;
+      case 'plate_discipline':
+        data = await this.brPlateDiscipline(playerInfo, year);
+        break;
+      default:
+        throw new Error(`Unknown stat_type: ${statType}`);
+    }
+
+    const result = {
+      player: playerInfo.name,
+      br_id: playerInfo.id,
+      year,
+      stat_type: statType,
+      ...(splitType && { split_type: splitType }),
+      data,
+    };
+
+    this.brCache.set(cacheKey, { data: result, fetchedAt: Date.now() });
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   }
 
   async run() {

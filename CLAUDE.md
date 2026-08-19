@@ -42,6 +42,7 @@ Phil has 22 MCP tools that connect directly to live Yahoo Fantasy and MLB data. 
 ### When to use MCP tools (always):
 - Player availability, team affiliation, or roster status → `get_team_roster`, `find_free_agents`, `get_waiver_wire_targets`
 - Standings or matchup score → `get_standings`, `get_matchup`
+- League-wide schedule / who-plays-who across weeks → `get_schedule`
 - Wire scans → `get_waiver_wire_targets`, `find_free_agents`
 - Age/rebuild analysis → `get_team_age_profile`, `get_rebuild_scorecard`
 - Opponent research → `team_needs_analysis`, `get_league_power_rankings`

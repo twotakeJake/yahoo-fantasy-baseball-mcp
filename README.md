@@ -49,6 +49,7 @@ Age data is pulled live from the **MLB Stats API** and cross-referenced by name 
 | `get_standings` | W/L/T record, win pct, streak, and rank for all teams |
 | `get_league_transactions` | Recent league-wide adds, drops, and trades. Filterable by type |
 | `get_matchup` | Current week H2H matchup — your roster vs opponent's, with category stat breakdown |
+| `get_schedule` | Full league schedule for one or more weeks — all matchups with competitive_tier labels (top_vs_top, etc.) and results for completed weeks. Defaults to remaining regular-season weeks |
 
 ### Logs & Accountability
 

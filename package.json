@@ -10,7 +10,8 @@
     "get-token": "node build/get-token.js",
     "refresh-token": "node build/refresh-token.js",
     "dev": "tsc && node build/index.js",
-    "test": "npm run build && node --test --experimental-test-coverage build/__tests__/transforms.test.js"
+    "test": "npm run build && node --test build/__tests__/transforms.test.js",
+    "test:coverage": "npm run build && node --test --experimental-test-coverage build/__tests__/transforms.test.js"
   },
   "devDependencies": {
     "@types/dotenv": "^6.1.1",

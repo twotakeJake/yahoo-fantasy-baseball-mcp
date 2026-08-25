@@ -6,5 +6,189 @@
     "dropped_for": "Quinn Priester",
     "notes": "Opening Day starter for SD. 2.87 ERA, 0.99 WHIP, 190K in 181.2 IP in 2025. Dropped him too early — arm fatigue in spring was minor.",
     "date_dropped": "2026-03-25"
+  },
+  {
+    "name": "Ezequiel Tovar",
+    "position": "SS",
+    "mlbTeam": "COL",
+    "dropped_date": "2026-04-23",
+    "dropped_for": "Brayan Rocchio",
+    "notes": "24 years old, fits rebuild. Rockies context hurts counting stats. Monitor if he moves teams or breaks out."
+  },
+  {
+    "name": "Mike Burrows",
+    "position": "SP",
+    "mlbTeam": "HOU",
+    "dropped_date": "2026-04-23",
+    "dropped_for": "Rhett Lowder",
+    "notes": "Elite K rate (34%) and stuff but 22.7% walk rate is structural problem. Monitor if he fixes command."
+  },
+  {
+    "name": "Zac Gallen",
+    "position": "SP",
+    "mlbTeam": "AZ",
+    "dropped_date": "2026-04-29",
+    "dropped_for": "Reid Detmers",
+    "notes": "30 years old, shoulder contusion DTD. Dropped while injured. Monitor if he returns healthy and recaptures 2024 form."
+  },
+  {
+    "name": "Reynaldo López",
+    "position": "SP",
+    "mlbTeam": "ATL",
+    "dropped_date": "2026-04-29",
+    "dropped_for": "Andres Gimenez",
+    "notes": "Moved to bullpen for mechanical issues. xERA 5.36 flagged regression. 32 years old, didn't fit rebuild."
+  },
+  {
+    "name": "Nathan Eovaldi",
+    "position": "SP",
+    "mlbTeam": "TEX",
+    "dropped_date": "2026-04-29",
+    "dropped_for": "Aaron Ashby",
+    "notes": "31 years old, didn't fit rebuild. 5.40 ERA, hard hit rate 48.9%. Dropped for younger higher-upside arm."
+  },
+  {
+    "name": "Shane Bieber",
+    "position": "SP",
+    "mlbTeam": "TOR",
+    "dropped_date": "2026-04-29",
+    "dropped_for": "Michael McGreevy",
+    "notes": "31 years old, IL60 elbow inflammation. Dropped while injured. Elbow + age = risk."
+  },
+  {
+    "name": "Bryson Stott",
+    "position": "2B,SS",
+    "mlbTeam": "PHI",
+    "dropped_date": "2026-04-29",
+    "dropped_for": "Unknown",
+    "notes": "Opening Day roster, dropped early. Monitor if he rebounds with Phillies."
+  },
+  {
+    "name": "Miguel Vargas",
+    "position": "1B,3B",
+    "mlbTeam": "CWS",
+    "dropped_date": "2026-04-29",
+    "dropped_for": "Unknown",
+    "notes": "BABIP victim early, underlying contact quality showed promise. White Sox context limits upside."
+  },
+  {
+    "name": "Robert Hassell III",
+    "position": "CF,RF",
+    "mlbTeam": "WSH",
+    "dropped_date": "2026-04-29",
+    "dropped_for": "Unknown",
+    "notes": "23 years old, showing NA status. Young prospect, worth monitoring if he gets healthy and gets playing time."
+  },
+  {
+    "name": "Luis Robert Jr.",
+    "position": "CF",
+    "mlbTeam": "NYM",
+    "dropped_date": "2026-04-29",
+    "dropped_for": "Miguel Vargas",
+    "notes": "47.1 degree launch angle causing pop-ups despite 32% Barrel rate. Dropped for Vargas. Monitor if he fixes launch angle."
+  },
+  {
+    "name": "George Springer",
+    "position": "LF,CF,RF",
+    "mlbTeam": "TOR",
+    "dropped_date": "2026-05-06",
+    "dropped_for": "Brooks Lee",
+    "notes": "36 years old, .185 AVG, toe injury. Doesn't fit rebuild. Dropped after long deliberation. Don't look back."
+  },
+  {
+    "name": "Jordan Westburg",
+    "position": "2B,3B",
+    "mlbTeam": "BAL",
+    "dropped_date": "2026-05-06",
+    "dropped_for": "Free agent",
+    "notes": "Partial UCL tear, setback in throwing program May 2026, Tommy John surgery likely. Season in doubt. Monitor for 2027 keeper consideration if he recovers fully."
+  },
+  {
+    "name": "Dennis Santana",
+    "position": "RP",
+    "mlbTeam": "PIT",
+    "dropped_date": "2026-05-06",
+    "dropped_for": "Keider Montero",
+    "notes": "Blown saves Apr 27 and May 5. xERA 5.39 vs ERA 4.02 — luck running out. Lost closer role to Gregory Soto. Dropped for younger higher-upside arm."
+  },
+  {
+    "name": "Andrew Abbott",
+    "position": "SP",
+    "mlbTeam": "CIN",
+    "dropped_date": "2026-05-06",
+    "dropped_for": "Juan Morillo",
+    "notes": "42% K rate elite but 28:19 K:BB ratio season-long structural problem. 5.13 ERA, 1.64 WHIP. Dropped for bullpen upgrade. Monitor if he fixes command."
+  },
+  {
+    "name": "Quinn Priester",
+    "position": "SP,RP",
+    "mlbTeam": "MIL",
+    "dropped_date": "2026-05-11",
+    "dropped_for": "Free agent",
+    "notes": "IL15 wrist + shoulder soreness in rehab. Poor rehab outing May 9. No clear return timeline. 25 years old — monitor recovery for potential reclaim if he gets healthy mid-season."
+  },
+  {
+    "name": "Yainer Diaz",
+    "position": "C",
+    "mlbTeam": "HOU",
+    "dropped_date": "2026-05-14",
+    "dropped_for": "Cal Raleigh IL slot",
+    "notes": "C, HOU. Dropped to clear IL slot for Raleigh. -4.3 bWAR, lowest of three C options. Coming off oblique injury. Dingler flatly better. Monitor recovery."
+  },
+  {
+    "name": "Andrés Giménez",
+    "position": "2B,SS",
+    "mlbTeam": "TOR",
+    "dropped_date": "2026-06-10",
+    "dropped_for": "Grant Taylor",
+    "notes": "27 years old, -2.3 bWAR, 51.6 launch angle killing production despite elite barrel rate. MI room too crowded with Torres/Altuve/Rocchio/Lee all healthy. Dropped for Grant Taylor."
+  },
+  {
+    "name": "Seth Lugo",
+    "position": "SP",
+    "mlbTeam": "KC",
+    "dropped_date": "2026-07-21",
+    "dropped_for": "Dustin May",
+    "notes": "Dropped 7/21/26. Declining K/9 confirmed multi-year trend (7.88 in 2024 → 7.74 in 2025 → 6.96 in 2026 → 5.31 last month → zero-K start 6/19). 4.39 ERA, 1.41 WHIP, age 30. ERA/WHIP still serviceable but costing K, K/9, K/BB every start. May (xERA 3.25, age 28) is the clear upgrade. Monitor in case K stuff returns — unlikely given trajectory."
+  },
+  {
+    "name": "Gleyber Torres",
+    "position": "2B",
+    "mlbTeam": "DET",
+    "dropped_date": "2026-07-23",
+    "dropped_for": "Roster space for IL returns",
+    "notes": "Dropped 7/23/26. Second oblique strain of 2026 — first missed 6/16-7/20, re-injured two weeks after return. Sports hernia surgery Oct 2025. Pre-injury wOBA .354 and OBP .397 genuine but 0 SB, 4 HR, 29 years old, body keeps breaking down same spot. No help in HR or SB. Not a keeper."
+  },
+  {
+    "name": "Jo Adell",
+    "position": "LF,CF,RF",
+    "mlbTeam": "LAA",
+    "dropped_date": "2026-07-23",
+    "dropped_for": "Roster space for IL returns",
+    "notes": "Dropped 7/23/26. Platoon split is career-defining: .215/.266/.331 vs RHP in 304 PAs vs .309/.345/.573 vs LHP in 119 PAs. Can't platoon in Yahoo format. Career 0.1 fWAR in 6 seasons despite elite tools. Not a keeper."
+  },
+  {
+    "name": "Geraldo Perdomo",
+    "position": "SS",
+    "mlbTeam": "AZ",
+    "dropped_date": "2026-07-23",
+    "dropped_for": null,
+    "notes": "Dropped early 2026 in favor of Brayan Rocchio — the right call in retrospect, as Rocchio won the season-long Rocchio vs Perdomo debate decisively (.271/.335/.405, 15 SB vs Perdomo's lesser 2026 line). But the process around the decision was flawed — early analysis relied too heavily on Yahoo+ proprietary stats (including the bWAR metric that turned out to be offense-only and methodologically unreliable) rather than triangulating Statcast, BR splits, and analyst opinion. The Perdomo case became the foundational 'case study model' for how we now approach all player comparisons: integrate multiple independent sources before concluding. The decision was ultimately correct; the method that got us there was not. Logged retroactively 7/23/26 as the origin point of the analytical framework."
+  },
+  {
+    "name": "Spencer Miles",
+    "position": "SP,RP",
+    "mlbTeam": "TOR",
+    "dropped_date": "2026-08-10",
+    "dropped_for": null,
+    "notes": "Dropped 8/10/26 for Kyle Harrison's activation off IL. Added 6/10/26 for Perdomo when he posted elite early numbers (2.16 ERA, xERA 2.74, 51% K rate) as rotation depth during Cease's absence. Toronto never gave him a rotation spot — settled into reliever/opener role all season, finishing with 0 QS in 64+ IP. ERA regressed as sample grew. Original reason for adding (rotation depth while Cease was out) no longer applicable with Cease healthy and Harrison returning. Served his purpose for the stretch of the season he was needed."
+  },
+  {
+    "name": "Jose Altuve",
+    "position": "2B,LF",
+    "mlbTeam": "HOU",
+    "dropped_date": "2026-08-12",
+    "dropped_for": null,
+    "notes": "Dropped 8/12/26 for Didier Fuentes. Season line: .240 AVG, .302 OBP, .391 SLG, 13 HR, 2 SB, .308 wOBA. Launch angle 49.7 degrees — worst pop-up profile we diagnosed all season, worse than Perdomo (43.9), Robert Jr. (47.3), and Gimenez (48.0). Elite Barrel% going straight up not out. Newly DTD (foot) at time of drop. Age 36, no keeper case. Was being carried as bench depth but provided no real value once Walker returned to LF. The foot DTD made this the cleanest version of a drop we'd been circling for weeks. Replaced by Didier Fuentes (21, ATL, xERA 2.30)."
   }
 ]

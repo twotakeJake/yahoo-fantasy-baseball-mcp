@@ -190,5 +190,13 @@
     "dropped_date": "2026-08-12",
     "dropped_for": null,
     "notes": "Dropped 8/12/26 for Didier Fuentes. Season line: .240 AVG, .302 OBP, .391 SLG, 13 HR, 2 SB, .308 wOBA. Launch angle 49.7 degrees — worst pop-up profile we diagnosed all season, worse than Perdomo (43.9), Robert Jr. (47.3), and Gimenez (48.0). Elite Barrel% going straight up not out. Newly DTD (foot) at time of drop. Age 36, no keeper case. Was being carried as bench depth but provided no real value once Walker returned to LF. The foot DTD made this the cleanest version of a drop we'd been circling for weeks. Replaced by Didier Fuentes (21, ATL, xERA 2.30)."
+  },
+  {
+    "name": "Matt Shaw",
+    "position": "3B,RF",
+    "mlbTeam": "CHC",
+    "dropped_date": "2026-08-28",
+    "dropped_for": null,
+    "notes": "Dropped 8/28/26 to resolve roster crunch caused by his own IL activation. Held in IL fridge since 7/1/26 (hand injury, 58 days). Cleared IL overnight 8/28 and Yahoo forced a drop to fix Error #160 (over max roster size). Every pitcher on the roster had more immediate value than 3 end-of-season at-bats from a player returning from a hand injury. Keeper case remains open for 2027 spring — decision should be based on health in spring training, role clarity with CHC (still blocked by Bregman and Hoerner), and whether he gets a clear path to at-bats. The 2026 sample (130 PA, .246/.322/.415 pre-injury) was legitimate but incomplete. If healthy and with a clear role, re-evaluate as a free agent pick in 2027 draft or keeper conversation."
   }
 ]

@@ -84,14 +84,15 @@ Age data is pulled live from the **MLB Stats API** and cross-referenced by name 
 
 ## Setup
 
-### 1. Register a Yahoo App
+### 1. Get your Yahoo session cookies
 
-1. Go to [developer.yahoo.com/apps/create](https://developer.yahoo.com/apps/create)
-2. Fill in:
-   - **App Name:** anything, e.g. `Fantasy Baseball Claude`
-   - **Redirect URI:** `https://localhost:8080`
-   - **API Permissions:** `Fantasy Sports → Read`
-3. Copy your **Client ID** and **Client Secret**
+This server authenticates with your **Yahoo session cookies**, not OAuth — Yahoo's OAuth 2.0 tokens are rejected by the Fantasy Sports API with a 403 (see [Authentication](#authentication)).
+
+1. Log in to [baseball.fantasysports.yahoo.com](https://baseball.fantasysports.yahoo.com) in your browser.
+2. Open DevTools → **Network** tab, reload the page, and click any request to `fantasysports.yahoo.com`.
+3. Under **Request Headers**, copy the full **`Cookie`** header value — that string is your `YAHOO_COOKIES`.
+
+Cookies last weeks to months. When they expire (calls start returning 401), repeat this step and update the value. `YAHOO_CRUMB` is optional — the server fetches and refreshes it automatically.
 
 ### 2. Clone and Install
 
@@ -107,39 +108,24 @@ npm install
 cp .env.example .env
 ```
 
-Edit `.env` and fill in your credentials:
+Edit `.env` and fill in your values:
 
 ```
-YAHOO_CLIENT_ID=your_client_id
-YAHOO_CLIENT_SECRET=your_client_secret
+YAHOO_COOKIES=your_full_cookie_header_string
 YAHOO_LEAGUE_ID=your_league_id
 YAHOO_TEAM_NUMBER=your_team_number
 YAHOO_TEAM_NAME=your_team_name
 ```
 
-> Your league ID is in the URL when you visit your Yahoo Fantasy league page. Your team number is your team's position in the league (visible in the team URL).
+> Your league ID is in the URL when you visit your Yahoo Fantasy league page. Your team number is your team's position in the league (visible in the team URL). `YAHOO_CRUMB` is optional — the server fetches one automatically.
 
-### 4. Get an Access Token
-
-```bash
-npm run get-token
-```
-
-This opens your browser to Yahoo's authorization page. After you approve the app, Yahoo redirects to `https://localhost:8080?code=...` — the page will show a connection error, which is expected. Copy the full URL from your browser's address bar and paste it back into the terminal. The script exchanges the code for tokens and writes them to `.env` automatically.
-
-To silently refresh an expired token without a browser:
-
-```bash
-npm run refresh-token
-```
-
-### 5. Build
+### 4. Build
 
 ```bash
 npm run build
 ```
 
-### 6. Add to Claude Code
+### 5. Add to Claude Code
 
 Add the following to your Claude MCP settings file (`~/.claude/settings.json`):
 
@@ -150,10 +136,7 @@ Add the following to your Claude MCP settings file (`~/.claude/settings.json`):
       "command": "node",
       "args": ["/absolute/path/to/yahoo-fantasy-baseball-mcp/build/index.js"],
       "env": {
-        "YAHOO_CLIENT_ID": "your_client_id",
-        "YAHOO_CLIENT_SECRET": "your_client_secret",
-        "YAHOO_ACCESS_TOKEN": "your_access_token",
-        "YAHOO_REFRESH_TOKEN": "your_refresh_token",
+        "YAHOO_COOKIES": "your_full_cookie_header_string",
         "YAHOO_LEAGUE_ID": "your_league_id",
         "YAHOO_TEAM_NUMBER": "your_team_number",
         "YAHOO_TEAM_NAME": "your_team_name"
@@ -166,7 +149,7 @@ Add the following to your Claude MCP settings file (`~/.claude/settings.json`):
 
 > Use the full absolute path. Relative paths are a common failure point.
 
-### 7. Restart Claude Code
+### 6. Restart Claude Code
 
 Start a new Claude Code session and test it:
 
@@ -178,13 +161,21 @@ Start a new Claude Code session and test it:
 
 | Variable | Required | Description |
 |---|---|---|
-| `YAHOO_CLIENT_ID` | Yes | OAuth app Client ID |
-| `YAHOO_CLIENT_SECRET` | Yes | OAuth app Client Secret |
-| `YAHOO_ACCESS_TOKEN` | Yes | OAuth 2.0 Bearer access token (populated by `npm run get-token`) |
-| `YAHOO_REFRESH_TOKEN` | Yes | OAuth refresh token — used for silent auto-refresh on 401s |
+| `YAHOO_COOKIES` | Yes | Full `Cookie` header from an authenticated Yahoo Fantasy browser session |
 | `YAHOO_LEAGUE_ID` | Yes | Your Yahoo Fantasy league ID |
 | `YAHOO_TEAM_NUMBER` | Yes | Your team number within the league |
+| `YAHOO_CRUMB` | No | Yahoo crumb token; fetched and refreshed automatically if omitted |
 | `YAHOO_TEAM_NAME` | No | Display name for your team (cosmetic only) |
+
+> **Deprecated:** `YAHOO_CLIENT_ID`, `YAHOO_CLIENT_SECRET`, `YAHOO_ACCESS_TOKEN`, and `YAHOO_REFRESH_TOKEN` are only used by the legacy OAuth helper scripts (`npm run get-token` / `refresh-token`). The live server ignores them — see [Authentication](#authentication).
+
+---
+
+## Authentication
+
+The server authenticates with **Yahoo session cookies + a crumb token**, sent as a `Cookie` header on each request (no `Authorization` header). On a 401 it fetches a fresh crumb from the Yahoo Fantasy page and retries automatically.
+
+**Why not OAuth?** Yahoo's OAuth 2.0 flow still issues tokens, but the Fantasy Sports API rejects them with `403 "This application is not authorized"`. The `get-token` / `refresh-token` scripts and their `CLIENT_ID`/`CLIENT_SECRET`/`ACCESS_TOKEN`/`REFRESH_TOKEN` variables remain in the repo for reference only and are not used at runtime.
 
 ---
 
@@ -194,12 +185,22 @@ These files are created and maintained automatically in the `data/` directory:
 
 | File | Purpose |
 |---|---|
+**Authored data** (version-controlled — your records live here):
+
+| File | Purpose |
+|---|---|
 | `data/rubric_config.json` | Phil Rebuild Rubric config — milestones, age weights, top-30 bonus players, young core baseline |
 | `data/rebuild_progress.json` | Age profile snapshots over time (written by `rebuild_progress_tracker`) |
+| `data/regret_list.json` | Dropped/traded-away player log (written by `regret_list`) |
+| `data/trade_history.json` | Trade log (written by `trade_history_log`) |
+| `data/advice_log.json` | Phil's advice accountability log (written by `evaluate_advice`) |
+
+**Regenerable caches** (git-ignored — rewritten by tools each run, safe to delete):
+
+| File | Purpose |
+|---|---|
 | `data/wire_snapshot.json` | Last waiver wire scan (used by `get_waiver_wire_delta`) |
-| `data/regret_list.json` | Dropped/traded-away player log |
-| `data/trade_history.json` | Trade log |
-| `data/advice_log.json` | Phil's advice accountability log |
+| `data/injury_snapshot.json` | Last roster injury scan (used by `get_roster_injury_sweep`) |
 
 The file `docs/trade_scenarios.md` is a manually maintained counter-offer reference for crown jewel players, parsed programmatically by `get_trade_scenarios` and `trade_history_log`.
 
@@ -208,18 +209,17 @@ The file `docs/trade_scenarios.md` is a manually maintained counter-offer refere
 ## Testing
 
 ```bash
-npm test
+npm test            # build + run the suite (98 tests)
+npm run test:coverage   # same, with coverage report (Node 22+)
 ```
 
-Tests cover the pure data-transformation layer — the functions responsible for parsing Yahoo's API response format, normalizing player names, and resolving player ages.
+> `npm test` runs coverage-free so it passes on all supported Node versions — Node 20/22 crash the experimental coverage reporter. Use `test:coverage` for the report.
 
-```
-transforms.js | line: 100% | branch: 96.55% | funcs: 100%
-```
+Tests cover the pure data-transformation layer — the functions responsible for parsing Yahoo's API response format, normalizing names and ages, building lineups, and computing standings/matchup/signal logic. Current coverage: **line 98.8% · branch 94.1% · funcs 100%**.
 
-**What is tested:** `normalizeName`, `lookupAge`, `extractField`, `parsePlayerInfo`, `extractPlayersMap`
+**What is tested (14 functions):** `normalizeName`, `lookupAge`, `extractField`, `parsePlayerInfo`, `extractPlayersMap`, `buildOptimalLineup`, `computeCategoryRankings`, `adpTier`, `generateBatterSignals`, `generatePitcherSignals`, `rankBand`, `competitiveTier`, `mapMatchupStatus`, `defaultScheduleWeeks`
 
-**What is not tested:** The API I/O layer requires live Yahoo and MLB API credentials. Mocking them would add complexity without catching the actual failure mode (API contract changes).
+**What is not tested:** The API I/O layer requires live Yahoo and MLB credentials (and, for the scraper tools, live RotoWire / Baseball-Reference HTML). Mocking them would add complexity without catching the actual failure mode — API contract and page-structure changes.
 
 ---
 
